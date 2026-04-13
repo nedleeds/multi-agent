@@ -32,15 +32,20 @@ def run_subagent(
     registry: ToolRegistry,
     system: str,
     description: str = "subtask",
+    tools: list[dict] | None = None,
 ) -> str:
-    """Run a subagent with fresh context and return its final text summary."""
+    """Run a subagent with fresh context and return its final text summary.
+
+    tools: tool schemas to give the subagent (default: CHILD_TOOLS).
+           Pass API-specific tool sets for specialized subagents.
+    """
     print_info(f"[subagent:{description}] starting…")
     state = LoopState(messages=[{"role": "user", "content": prompt}])
 
     agent_loop(
         state=state,
         model=model,
-        tools=definitions.CHILD_TOOLS,
+        tools=tools if tools is not None else definitions.CHILD_TOOLS,
         registry=registry,
         system=system,
         max_turns=_MAX_TURNS,
