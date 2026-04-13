@@ -15,8 +15,6 @@
           → 모든 결과 종합 → 구조화된 분석 리포트
 """
 
-from pathlib import Path
-
 from model.base import BaseLLM
 from tools import definitions
 from tools.api import BitbucketClient, ConfluenceClient, JiraClient
@@ -28,8 +26,6 @@ from .loop import agent_loop
 from .planner import TodoManager
 from .state import CompactState, LoopState
 from .subagent import run_subagent
-
-_WORKDIR = Path.cwd()
 
 _SYSTEM_PROMPT = """\
 You are an expert incident analysis agent. Your job is to investigate field issues by searching \
