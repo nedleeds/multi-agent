@@ -9,6 +9,8 @@ class LoopState:
     messages: list[dict]
     turn_count: int = 1
     transition_reason: str | None = None
+    # 연속 finish_reason=="length" 발생 횟수 — 무한 continue 방지용 카운터
+    length_continues: int = 0
 
 
 @dataclass

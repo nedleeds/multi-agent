@@ -4,8 +4,11 @@ version = "0.1.0"
 description = "Multi-agent system: ollama orchestrator (s01–s06) + vllm subagent"
 requires-python = ">=3.13.0"
 dependencies = [
+    "debugpy>=1.8.20",
     "openai>=1.55.0",
     "python-dotenv>=1.0.0",
+    "requests>=2.33.1",
+    "prompt-toolkit>=3.0.0",
     "rich>=13.0.0",
 ]
 

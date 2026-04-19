@@ -5,9 +5,12 @@ Server (Data Center) / Cloud 모두 지원합니다.
   BITBUCKET_TYPE=cloud   → /2.0/
 
 지원 작업:
-  bitbucket_list_commits(keyword, limit) — 키워드로 커밋 메시지 검색
-  bitbucket_get_commit(commit_id)        — 특정 커밋 상세 + diff
-  bitbucket_list_prs(query, state)       — PR 목록 (제목 키워드 필터)
+  bitbucket_list_commits(keyword, limit)    — 키워드로 커밋 메시지 검색
+  bitbucket_get_commit(commit_id)           — 특정 커밋 상세 + diff
+  bitbucket_list_prs(query, state)          — PR 목록 (제목 키워드 필터)
+  bitbucket_search_multi(queries, ...)      — 여러 키워드로 commit + PR 병렬 검색 + 취합
+  bitbucket_get_pr_diff(pr_id)              — 특정 PR 의 unified diff 원문
+  bitbucket_compare(from_ref, to_ref)       — 두 ref(브랜치/태그/커밋) 간 diff
 """
 
 import json
@@ -77,7 +80,7 @@ class BitbucketClient:
             ]
 
         if not commits:
-            msg = f"No commits found" + (f" matching '{keyword}'" if keyword else "")
+            msg = "No commits found" + (f" matching '{keyword}'" if keyword else "")
             return msg
 
         return json.dumps(
@@ -101,14 +104,14 @@ class BitbucketClient:
             resp.raise_for_status()
             commit = resp.json()
 
-            # 변경 파일 목록
+            # 변경 파일 목록 — 원문 전체 (tool output 단에서 200KB 절삭됨)
             diff_resp = requests.get(
                 self._url(f"{self._repo_path()}/commits/{commit_id}/diff"),
                 auth=self._auth(),
                 headers={"Accept": "text/plain"},
                 timeout=30,
             )
-            diff_text = diff_resp.text[:3000] if diff_resp.ok else "(diff unavailable)"
+            diff_text = diff_resp.text if diff_resp.ok else "(diff unavailable)"
         except requests.HTTPError as exc:
             return f"Bitbucket API error {exc.response.status_code}: {exc.response.text[:400]}"
         except requests.RequestException as exc:
@@ -119,6 +122,166 @@ class BitbucketClient:
             "diff_preview": diff_text,
         }
         return json.dumps(result, ensure_ascii=False, indent=2)
+
+    def get_pr_diff(self, pr_id: str) -> str:
+        """특정 PR 의 unified diff 원문을 반환한다 (파일 변경 내역 전체)."""
+        if not self.config.configured:
+            return _NOT_CONFIGURED
+
+        if self.config.server_type == "cloud":
+            path = f"{self._repo_path()}/pullrequests/{pr_id}/diff"
+        else:
+            path = f"{self._repo_path()}/pull-requests/{pr_id}/diff"
+        try:
+            resp = requests.get(
+                self._url(path),
+                auth=self._auth(),
+                headers={"Accept": "text/plain"},
+                timeout=60,
+            )
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            return f"Bitbucket API error {exc.response.status_code}: {exc.response.text[:400]}"
+        except requests.RequestException as exc:
+            return f"Bitbucket connection error: {exc}"
+        return resp.text or "(empty diff)"
+
+    def compare(self, from_ref: str, to_ref: str) -> str:
+        """두 ref(브랜치/태그/커밋) 간의 diff 를 반환한다.
+
+        Server: GET /compare/diff?from=…&to=…
+        Cloud:  GET /diff/{to..from}   (Cloud 스펙은 destination..source 순)
+        """
+        if not self.config.configured:
+            return _NOT_CONFIGURED
+
+        try:
+            if self.config.server_type == "cloud":
+                spec = f"{to_ref}..{from_ref}"
+                resp = requests.get(
+                    self._url(f"{self._repo_path()}/diff/{spec}"),
+                    auth=self._auth(),
+                    headers={"Accept": "text/plain"},
+                    timeout=60,
+                )
+            else:
+                resp = requests.get(
+                    self._url(f"{self._repo_path()}/compare/diff"),
+                    params={"from": from_ref, "to": to_ref},
+                    auth=self._auth(),
+                    headers={"Accept": "text/plain"},
+                    timeout=60,
+                )
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            return f"Bitbucket API error {exc.response.status_code}: {exc.response.text[:400]}"
+        except requests.RequestException as exc:
+            return f"Bitbucket connection error: {exc}"
+        return resp.text or "(empty diff)"
+
+    def search_multi(
+        self,
+        queries: list[str],
+        commit_limit: int = 50,
+        pr_state: str = "ALL",
+        top_k: int = 20,
+    ) -> str:
+        """여러 키워드로 commit/PR 을 **한 번 fetch 해 클라이언트 필터** 후 취합.
+
+        - commits 는 최근 N 개를 한 번만 받아와서 각 키워드에 대해 메시지 매칭
+        - PRs 도 최근 목록 한 번만 받아서 제목 매칭
+        - id 로 dedupe + matched_queries 기록 + match_score 랭킹
+        """
+        if not self.config.configured:
+            return _NOT_CONFIGURED
+        if not queries:
+            return "Error: queries must be non-empty list"
+
+        commit_limit = min(max(1, commit_limit), 100)
+        top_k = min(max(1, top_k), 100)
+
+        # fetch once
+        try:
+            c_resp = requests.get(
+                self._url(f"{self._repo_path()}/commits"),
+                params={"limit": commit_limit},
+                auth=self._auth(),
+                headers=self._headers(),
+                timeout=30,
+            )
+            c_resp.raise_for_status()
+            p_resp = requests.get(
+                self._url(f"{self._repo_path()}/pull-requests"),
+                params={"limit": 50, "state": pr_state.upper()},
+                auth=self._auth(),
+                headers=self._headers(),
+                timeout=30,
+            )
+            p_resp.raise_for_status()
+        except requests.HTTPError as exc:
+            return f"Bitbucket API error {exc.response.status_code}: {exc.response.text[:400]}"
+        except requests.RequestException as exc:
+            return f"Bitbucket connection error: {exc}"
+
+        c_data = c_resp.json()
+        commits_raw = c_data.get("values", c_data) if isinstance(c_data, dict) else c_data
+        prs_raw = p_resp.json().get("values", [])
+
+        # client-side multi-match
+        commit_agg: dict[str, dict] = {}
+        pr_agg: dict[str, dict] = {}
+
+        for q in queries:
+            ql = q.lower()
+            for c in commits_raw:
+                msg = (c.get("message") or (c.get("summary") or {}).get("raw", "")).lower()
+                if ql in msg:
+                    cid = str(c.get("id") or c.get("hash", ""))
+                    slot = commit_agg.setdefault(cid, {"commit": c, "matched": []})
+                    if q not in slot["matched"]:
+                        slot["matched"].append(q)
+            for pr in prs_raw:
+                title = (pr.get("title") or "").lower()
+                desc = (pr.get("description") or "").lower()
+                if ql in title or ql in desc:
+                    pid = str(pr.get("id", ""))
+                    slot = pr_agg.setdefault(pid, {"pr": pr, "matched": []})
+                    if q not in slot["matched"]:
+                        slot["matched"].append(q)
+
+        commit_items = sorted(commit_agg.values(), key=lambda x: len(x["matched"]), reverse=True)[:top_k]
+        pr_items = sorted(pr_agg.values(), key=lambda x: len(x["matched"]), reverse=True)[:top_k]
+
+        commits_out = []
+        for item in commit_items:
+            s = self._summarize_commit(item["commit"])
+            s["matched_queries"] = item["matched"]
+            s["match_score"] = f"{len(item['matched'])}/{len(queries)}"
+            commits_out.append(s)
+
+        prs_out = []
+        for item in pr_items:
+            pr = item["pr"]
+            prs_out.append({
+                "id": pr.get("id"),
+                "title": pr.get("title", ""),
+                "state": pr.get("state", ""),
+                "author": (pr.get("author") or {}).get("displayName") or
+                          (pr.get("author") or {}).get("user", {}).get("displayName", ""),
+                "created": (pr.get("createdDate") or pr.get("created_on") or "")[:10],
+                "updated": (pr.get("updatedDate") or pr.get("updated_on") or "")[:10],
+                "matched_queries": item["matched"],
+                "match_score": f"{len(item['matched'])}/{len(queries)}",
+            })
+
+        return json.dumps({
+            "queries_executed": queries,
+            "commits_unique": len(commit_agg),
+            "prs_unique": len(pr_agg),
+            "ranking": "match_score desc",
+            "commits": commits_out,
+            "pull_requests": prs_out,
+        }, ensure_ascii=False, indent=2)
 
     def list_prs(self, query: str = "", state: str = "ALL") -> str:
         """PR 목록을 반환합니다. query로 제목 필터링, state로 상태 필터링."""
@@ -146,7 +309,7 @@ class BitbucketClient:
             prs = [p for p in prs if q_lower in (p.get("title") or "").lower()]
 
         if not prs:
-            return f"No pull requests found" + (f" matching '{query}'" if query else "")
+            return "No pull requests found" + (f" matching '{query}'" if query else "")
 
         results = []
         for pr in prs:

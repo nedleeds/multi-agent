@@ -4,8 +4,12 @@ from abc import ABC, abstractmethod
 
 from openai.types.chat import ChatCompletion
 
+from .config import ModelConfig
+
 
 class BaseLLM(ABC):
+    config: ModelConfig   # 모든 백엔드가 연결 정보(config)를 노출
+
     @abstractmethod
     def chat(
         self,

@@ -6,8 +6,10 @@ from .console import (
     print_plan,
     print_tool_call,
     print_user_prompt,
+    thinking_spinner,
 )
 from .messages import normalize_messages
+from .repl import REPLSession
 
 __all__ = [
     "console",
@@ -18,4 +20,6 @@ __all__ = [
     "print_plan",
     "print_tool_call",
     "print_user_prompt",
+    "thinking_spinner",
+    "REPLSession",
 ]

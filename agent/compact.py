@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from model.base import BaseLLM
-from utils.console import print_info
+from utils.console import compacting_spinner, print_info
 
 from .state import CompactState
 
@@ -81,8 +81,9 @@ def compact_history(
         "Preserve: current goal, key findings, files changed, remaining work, user constraints.\n"
         "Be compact but concrete.\n\n" + conversation
     )
-    response = model.chat([{"role": "user", "content": prompt}])
-    summary = response.choices[0].message.content.strip()
+    with compacting_spinner():
+        response = model.chat([{"role": "user", "content": prompt}])
+    summary = (response.choices[0].message.content or "").strip()
 
     if focus:
         summary += f"\n\nNext focus: {focus}"

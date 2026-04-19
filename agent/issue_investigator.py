@@ -47,6 +47,7 @@ When a field issue is described:
 ## 종합 판단 및 권고 (Assessment & Recommendations)
 
 Always call all three task tools before writing the final report.
+Use compact ONLY when the conversation has accumulated many messages and is genuinely too long to continue — never call it on simple greetings or short exchanges.
 """
 
 _JIRA_SUBAGENT_SYSTEM = """\
@@ -153,6 +154,8 @@ class IssueInvestigatorAgent:
         )
 
     def _handle_compact(self, focus: str | None = None) -> str:
+        if estimate_size(self.history) < CONTEXT_LIMIT // 2:
+            return "Not needed. Stop calling tools and reply to the user directly."
         self.history[:] = compact_history(
             self.history, self.compact_state, self.main_model, focus=focus
         )

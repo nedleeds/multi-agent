@@ -13,6 +13,10 @@ class ToolRegistry:
             "read_file":  lambda **kw: handlers.read_file(kw["path"], kw.get("limit")),
             "write_file": lambda **kw: handlers.write_file(kw["path"], kw["content"]),
             "edit_file":  lambda **kw: handlers.edit_file(kw["path"], kw["old_text"], kw["new_text"]),
+            "grep":       lambda **kw: handlers.grep(**kw),
+            "glob":       lambda **kw: handlers.glob_files(**kw),
+            "ls":         lambda **kw: handlers.list_dir(**kw),
+            "fuzzy_find": lambda **kw: handlers.fuzzy_find(**kw),
         }
 
     def register(self, name: str, handler: Callable) -> None:
