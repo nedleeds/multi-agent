@@ -545,6 +545,15 @@ class OrchestratorAgent:
         """Process one user message and return the final assistant reply."""
         # Fresh turn — clear any leftover cancel from a prior run.
         self.cancel_event.clear()
+
+        # 이전 턴의 plan 이 전부 완료 상태면 historical — 현재 턴과 무관하므로 라이브
+        # 리전에서 치움. 미완료 item 이 남아있으면 사용자가 이어갈 수도 있으니 보존.
+        # Router 가 이번 턴에 새 plan 을 draft 하면 어차피 `_handle_todo` 가 교체하므로
+        # 여기서의 클리어는 "no-plan 후속 질문" 케이스에만 실제 효과.
+        items = self.planner.state.items
+        if items and all(i.status == "completed" for i in items):
+            self._handle_todo([])  # planner.update + display_set_todos([]) 둘 다 처리
+
         self.history.append({"role": "user", "content": user_input})
 
         # Drain background notifications before the next model call (s08)
