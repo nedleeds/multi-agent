@@ -111,6 +111,29 @@ def _has_depth_signal(user_msg: str) -> bool:
     return bool(_DEPTH_RE.search(user_msg or ""))
 
 
+def _is_thin_depth_reply(reply: str) -> bool:
+    """Depth 턴인데 답변이 구조 없는 generic prose 면 True.
+
+    판정: 아래 evidence-of-effort 신호 중 하나도 없으면 thin.
+      - 코드 블록 (``` fenced)
+      - 번호 리스트 (`1.` / `2.` 줄 시작)
+      - 3개 이상의 source file reference (`foo.py`, `utils/bar.py` 등)
+
+    모델이 "각 클라이언트에서 HTTP 오류를 raise_for_status() 로 감지…" 처럼
+    tool 결과 많이 읽고 한 덩어리 문단으로 정리한 케이스를 잡는다.
+    """
+    if not reply or len(reply) < 50:
+        return True
+    if "```" in reply:
+        return False
+    if re.search(r"^\s*\d+\.\s", reply, re.MULTILINE):
+        return False
+    src_refs = re.findall(r"\b[\w/._-]+\.(?:py|md|toml|json|yaml|yml|sh)\b", reply)
+    if len(src_refs) >= 3:
+        return False
+    return True
+
+
 class OrchestratorAgent:
     def __init__(
         self,
@@ -631,6 +654,48 @@ class OrchestratorAgent:
                 permissions=self.permissions,
                 max_turns=10,  # 실제 남은 step 실행하려면 여유 필요 (grep/read/analyze 조합)
             )
+
+        # Depth shape audit — depth-mode 턴인데 모델이 증거 잔뜩 읽고 generic 한 문단으로
+        # 마무리한 경우 (structured output 무시) → 재포맷만 요청. tool 재호출 유도 X.
+        if _has_depth_signal(user_input):
+            last_reply = ""
+            for msg in reversed(self.history):
+                if msg.get("role") == "assistant" and msg.get("content"):
+                    last_reply = msg["content"]
+                    break
+            if _is_thin_depth_reply(last_reply):
+                self.history.append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM audit — answer shape rejected]\n"
+                        "You gathered substantial evidence (multiple read_file + grep calls) but your "
+                        "final reply is a single paragraph without structure or citations. That wastes "
+                        "the research budget.\n\n"
+                        "**Re-format your previous answer** using ONLY the tool results already in this turn. "
+                        "Do NOT call read_file / grep / any other data-gathering tool — you have enough.\n\n"
+                        "Required format:\n"
+                        "1. `file.py:line` — one-line code quote of the critical logic\n"
+                        "2. `file.py:line` — ...\n"
+                        "3. ...\n\n"
+                        "Cover the full flow (pre-check → HTTP call → exception branches → caller propagation). "
+                        "Each step MUST cite a specific file:line you inspected and quote ≤2 lines of code verbatim."
+                    ),
+                })
+                reshape_state = LoopState(
+                    messages=self.history,
+                    cancel_event=self.cancel_event,
+                )
+                agent_loop(
+                    state=reshape_state,
+                    model=self.main_model,
+                    tools=tools,
+                    registry=self.registry,
+                    system=system_prompt,
+                    extra_handlers=self._extra_handlers,
+                    stream_to_console=True,
+                    permissions=self.permissions,
+                    max_turns=3,  # reformat 뿐이라 2–3 턴이면 충분
+                )
 
         # Track whether todo was updated this turn for the planner nudge
         used_todo = state.todo_called
