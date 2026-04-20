@@ -56,16 +56,16 @@ class MessageBus:
         msg = {"type": msg_type, "from": sender, "content": content, "timestamp": time.time()}
         if extra:
             msg.update(extra)
-        with open(self.dir / f"{to}.jsonl", "a") as f:
-            f.write(json.dumps(msg) + "\n")
+        with open(self.dir / f"{to}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list[dict]:
         p = self.dir / f"{name}.jsonl"
         if not p.exists():
             return []
-        msgs = [json.loads(line) for line in p.read_text().strip().splitlines() if line]
-        p.write_text("")  # drain
+        msgs = [json.loads(line) for line in p.read_text(encoding="utf-8").strip().splitlines() if line]
+        p.write_text("", encoding="utf-8")  # drain
         return msgs
 
     def broadcast(self, sender: str, content: str, members: list[str]) -> str:
@@ -104,11 +104,11 @@ class TeammateManager:
 
     def _load_config(self) -> dict:
         if self.config_path.exists():
-            return json.loads(self.config_path.read_text())
+            return json.loads(self.config_path.read_text(encoding="utf-8"))
         return {"team_name": "default", "members": []}
 
     def _save_config(self):
-        self.config_path.write_text(json.dumps(self.config, indent=2))
+        self.config_path.write_text(json.dumps(self.config, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def _find(self, name: str) -> dict | None:
         return next((m for m in self.config["members"] if m["name"] == name), None)
@@ -315,7 +315,8 @@ class TeammateManager:
     # ── Tool dispatch for teammates ─────────────────────────────────────────
 
     def _exec(self, name: str, tool_name: str, args: dict) -> str:
-        import subprocess
+        from utils.shell import run_shell
+
         workdir = self.workdir
 
         def safe(p: str) -> Path:
@@ -325,14 +326,12 @@ class TeammateManager:
             return resolved
 
         handlers = {
-            "bash": lambda: (
-                subprocess.run(args["command"], shell=True, cwd=workdir,
-                               capture_output=True, text=True, timeout=120)
-            ),
-            "read_file": lambda: open(safe(args["path"])).read()[:50_000],
+            # run_shell: Unix → /bin/sh, Windows → PowerShell
+            "bash": lambda: run_shell(args["command"], cwd=workdir, timeout=120),
+            "read_file": lambda: safe(args["path"]).read_text(encoding="utf-8", errors="replace")[:50_000],
             "write_file": lambda: (
                 safe(args["path"]).parent.mkdir(parents=True, exist_ok=True) or
-                safe(args["path"]).write_text(args["content"]) or
+                safe(args["path"]).write_text(args["content"], encoding="utf-8") or
                 f"Wrote {len(args['content'])} bytes"
             ),
             "send_message": lambda: self.bus.send(

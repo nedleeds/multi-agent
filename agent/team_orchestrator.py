@@ -20,6 +20,7 @@
 """
 
 import json
+import threading
 from pathlib import Path
 
 from model.base import BaseLLM
@@ -69,7 +70,11 @@ class TeamOrchestratorAgent:
         events = EventBus(_REPO_ROOT / ".worktrees" / "events.jsonl")
         self.worktrees = WorktreeManager(_REPO_ROOT, self.tasks, events)
 
+        self.cancel_event = threading.Event()
         self._extra_handlers = self._build_handlers()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
 
     # ── System prompt ─────────────────────────────────────────────────────────
 
@@ -156,6 +161,7 @@ class TeamOrchestratorAgent:
     # ── Main entry point ──────────────────────────────────────────────────────
 
     def run(self, user_input: str) -> str:
+        self.cancel_event.clear()
         self.history.append({"role": "user", "content": user_input})
 
         # Drain background notifications before calling the model
@@ -175,7 +181,7 @@ class TeamOrchestratorAgent:
                 self.history, self.compact_state, self.main_model
             )
 
-        state = LoopState(messages=self.history)
+        state = LoopState(messages=self.history, cancel_event=self.cancel_event)
         agent_loop(
             state=state,
             model=self.main_model,

@@ -34,7 +34,7 @@ def persist_large_output(tool_call_id: str, output: str) -> str:
     _TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = _TOOL_RESULTS_DIR / f"{tool_call_id}.txt"
     if not path.exists():
-        path.write_text(output)
+        path.write_text(output, encoding="utf-8")
     preview = output[:_PREVIEW_CHARS]
     return (
         "<persisted-output>\n"
@@ -69,9 +69,9 @@ def compact_history(
     # Persist transcript before discarding
     _TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     transcript = _TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with transcript.open("w") as f:
+    with transcript.open("w", encoding="utf-8") as f:
         for msg in messages:
-            f.write(json.dumps(msg, default=str) + "\n")
+            f.write(json.dumps(msg, default=str, ensure_ascii=False) + "\n")
     print_info(f"[compact] transcript → {transcript}")
 
     # Summarize

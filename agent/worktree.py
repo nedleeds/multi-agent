@@ -25,7 +25,7 @@ class EventBus:
         self.path = log_path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
-            self.path.write_text("")
+            self.path.write_text("", encoding="utf-8")
 
     def emit(
         self,
@@ -42,12 +42,12 @@ class EventBus:
         }
         if error:
             payload["error"] = error
-        with self.path.open("a") as f:
-            f.write(json.dumps(payload) + "\n")
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def list_recent(self, limit: int = 20) -> str:
         n = max(1, min(int(limit or 20), 200))
-        lines = self.path.read_text().splitlines()
+        lines = self.path.read_text(encoding="utf-8").splitlines()
         items = []
         for line in lines[-n:]:
             try:
@@ -67,6 +67,8 @@ def _detect_repo_root(cwd: Path) -> Path | None:
             cwd=cwd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
         return Path(r.stdout.strip()) if r.returncode == 0 else None
@@ -83,14 +85,15 @@ class WorktreeManager:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.dir / "index.json"
         if not self.index_path.exists():
-            self.index_path.write_text(json.dumps({"worktrees": []}, indent=2))
+            self.index_path.write_text(json.dumps({"worktrees": []}, indent=2), encoding="utf-8")
         self.git_available = self._is_git_repo()
 
     def _is_git_repo(self) -> bool:
         try:
             r = subprocess.run(
                 ["git", "rev-parse", "--is-inside-work-tree"],
-                cwd=self.repo_root, capture_output=True, text=True, timeout=10,
+                cwd=self.repo_root, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=10,
             )
             return r.returncode == 0
         except Exception:
@@ -101,17 +104,18 @@ class WorktreeManager:
             raise RuntimeError("Not in a git repository. worktree tools require git.")
         r = subprocess.run(
             ["git", *args], cwd=self.repo_root,
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=120,
         )
         if r.returncode != 0:
             raise RuntimeError((r.stdout + r.stderr).strip() or f"git {' '.join(args)} failed")
         return (r.stdout + r.stderr).strip() or "(no output)"
 
     def _load_index(self) -> dict:
-        return json.loads(self.index_path.read_text())
+        return json.loads(self.index_path.read_text(encoding="utf-8"))
 
     def _save_index(self, data: dict):
-        self.index_path.write_text(json.dumps(data, indent=2))
+        self.index_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def _find(self, name: str) -> dict | None:
         return next((w for w in self._load_index().get("worktrees", []) if w.get("name") == name), None)
@@ -177,8 +181,9 @@ class WorktreeManager:
         if not path.exists():
             return f"Error: Worktree path missing: {path}"
         try:
-            r = subprocess.run(command, shell=True, cwd=path,
-                               capture_output=True, text=True, timeout=300)
+            # run_shell: Unix → /bin/sh, Windows → PowerShell
+            from utils.shell import run_shell
+            r = run_shell(command, cwd=path, timeout=300)
             out = (r.stdout + r.stderr).strip()
             return out[:50_000] if out else "(no output)"
         except subprocess.TimeoutExpired:

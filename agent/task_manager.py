@@ -34,14 +34,14 @@ class TaskManager:
         p = self._path(task_id)
         if not p.exists():
             raise ValueError(f"Task {task_id} not found")
-        return json.loads(p.read_text())
+        return json.loads(p.read_text(encoding="utf-8"))
 
     def _save(self, task: dict):
-        self._path(task["id"]).write_text(json.dumps(task, indent=2, ensure_ascii=False))
+        self._path(task["id"]).write_text(json.dumps(task, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def _clear_dependency(self, completed_id: int):
         for f in self.dir.glob("task_*.json"):
-            task = json.loads(f.read_text())
+            task = json.loads(f.read_text(encoding="utf-8"))
             if completed_id in task.get("blockedBy", []):
                 task["blockedBy"].remove(completed_id)
                 self._save(task)
@@ -116,7 +116,7 @@ class TaskManager:
     def list_all(self) -> str:
         tasks = []
         for f in sorted(self.dir.glob("task_*.json"), key=lambda f: int(f.stem.split("_")[1])):
-            tasks.append(json.loads(f.read_text()))
+            tasks.append(json.loads(f.read_text(encoding="utf-8")))
         if not tasks:
             return "No tasks."
         lines = []
@@ -133,7 +133,7 @@ class TaskManager:
         """Return pending tasks with no owner and no blockers (for auto-claim)."""
         result = []
         for f in sorted(self.dir.glob("task_*.json"), key=lambda f: int(f.stem.split("_")[1])):
-            task = json.loads(f.read_text())
+            task = json.loads(f.read_text(encoding="utf-8"))
             if (task.get("status") == "pending"
                     and not task.get("owner")
                     and not task.get("blockedBy")):

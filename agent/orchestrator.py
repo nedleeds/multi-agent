@@ -24,18 +24,28 @@
 """
 
 import json
+import re
+import threading
 from pathlib import Path
 
 from model.base import BaseLLM
 from tools import definitions
 from tools.api import BitbucketClient, ConfluenceClient, JiraClient
 from tools.registry import ToolRegistry
-from utils.console import display_set_todos, print_info
+from utils.console import (
+    clear_activity,
+    display_set_todos,
+    print_info,
+    print_tool_call,
+    set_activity,
+)
 
 from .background import BackgroundManager
 from .compact import CONTEXT_LIMIT, compact_history, estimate_size, micro_compact
 from .loop import agent_loop
+from .permission import PermissionManager
 from .planner import TodoManager
+from .router import classify as classify_intent
 from .skill import SkillRegistry
 from .state import CompactState, LoopState
 from .subagent import run_subagent
@@ -47,12 +57,67 @@ _WORKDIR = Path.cwd()
 _REPO_ROOT = _detect_repo_root(_WORKDIR) or _WORKDIR
 
 
+# 사용자 입력에서 "깊게 답해줘" 의도를 감지하는 키워드. gpt-4o 기본 성향이 요약적이라
+# 별도 힌트 없으면 bullet list 로 납작하게 답변하는 경향 → 아래 키워드 중 하나가 매칭되면
+# 시스템 프롬프트에 depth mode 절 추가.
+_DEPTH_RE = re.compile(
+    r"("
+    # Korean — 명시적 depth 요청 + 구조/흐름/시퀀스 질문
+    r"자세히|상세히|구체적으로|심층적?|깊게|분석해|설명해|"
+    r"어떻게\s*(?:동작|돌아가|작동|대응|처리|움직|흘러|구성|구현)|"
+    r"시퀀스|플로우|흐름|구조|체계|체계적으로|"
+    # English
+    r"\bin\s?depth\b|\bthoroughly\b|\bdetailed\b|"
+    r"\bwalk\s?through\b|\bexplain\s+how\b|"
+    r"\bsequence\b|\bflow\b|\barchitecture\b|"
+    r"\bhow\s+does\s+(?:\w+\s+){1,4}(?:work|handle|respond|process|behave)"
+    r")",
+    re.IGNORECASE,
+)
+
+_DEPTH_APPENDIX = (
+    "\n\n## Response style (this turn — depth mode)\n"
+    "User explicitly asked for thorough explanation. Go deeper than usual:\n"
+    "- Cite concrete `file:line` references for claims (e.g. `utils/repl.py:292`).\n"
+    "- Include 2–4 short code snippets copied verbatim from inspected files (not paraphrased).\n"
+    "- Walk through structure/flow in order — not a flat bullet list of unrelated facts.\n"
+    "- If the question spans multiple modules, describe how they connect.\n"
+    "- Don't close with generic summary; close with actionable insight or next-step pointer.\n"
+    "\n"
+    "### For sequence / flow / 'how does X respond' questions (STRICT)\n"
+    "The answer MUST be a **numbered sequence** of concrete steps:\n"
+    "  1. <step name> — `file:line` + 1-line quote of the critical code\n"
+    "  2. ...\n"
+    "Cover BOTH happy path AND error branches. For API/IO code, explicitly enumerate:\n"
+    "  - pre-check (e.g. `configured` property) — which file, what it returns\n"
+    "  - HTTP call — request method/endpoint\n"
+    "  - exception classes caught — which ones, what each returns\n"
+    "  - caller propagation — how the error string reaches the user\n"
+    "\n"
+    "**Bad answer shape** (do NOT do this):\n"
+    "  \"각 클라이언트에서 HTTP 응답 코드와 텍스트를 포함한 에러 메시지를 반환하는 방식으로 처리됩니다.\"\n"
+    "  (vague, no file:line, no code, no sequence — reject this shape)\n"
+    "\n"
+    "**Good answer shape**:\n"
+    "  \"1. Config 체크 — `tools/api/bitbucket.py:N`: `if not self.config.configured: return _NOT_CONFIGURED`\n"
+    "   2. HTTP 호출 — `requests.get(self._url(...), auth=..., timeout=30)`\n"
+    "   3. HTTPError 캐치 — `except requests.HTTPError as exc: return f\\\"Bitbucket API error {status}: {text}\\\"`\n"
+    "   ...\"\n"
+)
+
+
+def _has_depth_signal(user_msg: str) -> bool:
+    """사용자 메시지에서 depth-dive 의도 키워드 탐지."""
+    return bool(_DEPTH_RE.search(user_msg or ""))
+
+
 class OrchestratorAgent:
     def __init__(
         self,
         main_model: BaseLLM,
         sub_model: BaseLLM,
         skills_dir: Path = _WORKDIR / "skills",
+        auto_approve_all: bool = False,
     ):
         self.main_model = main_model
         self.sub_model = sub_model
@@ -83,6 +148,23 @@ class OrchestratorAgent:
         self.worktrees = WorktreeManager(_REPO_ROOT, self.tasks, events)
 
         self._extra_handlers = self._build_extra_handlers()
+
+        # Cooperative cancellation — /cancel sets this. agent_loop + run_one_turn
+        # check between turns / between tool dispatches. Shared with all
+        # subagents so cancel propagates into nested loops.
+        self.cancel_event = threading.Event()
+
+        # 파괴적 tool (write_file / edit_file / 위험 bash / worktree_remove) 의
+        # 실행 직전 사용자 승인을 요구. REPL 이 이 manager 참조를 받아 키 입력으로
+        # approve/deny/auto_session 신호를 보냄.
+        # eval.py·CI 같은 비대화형 환경은 `auto_approve_all=True` 로 승인 요청을
+        # 즉시 통과시킴.
+        self.permissions = PermissionManager(auto_approve_all=auto_approve_all)
+
+        # System prompt is pure function of workdir + skill catalog — both static.
+        # Build once, reuse byte-identical across turns so the server-side KV prefix
+        # cache (vllm prefix caching / ollama) stays warm.
+        self._cached_system_prompt = self._build_system_prompt()
 
     # ── Registry (API 툴 — subagent 용) ───────────────────────────────────────
 
@@ -171,121 +253,98 @@ class OrchestratorAgent:
 
     # ── System prompts ───────────────────────────────────────────────────────
 
-    def _system_prompt(self) -> str:
+    def _build_system_prompt(self) -> str:
+        """Lean system prompt (~1.5K chars). Everything else lives in skills,
+        loaded on demand via `load_skill(name)`. Mirrors learn-claude-code's
+        `s_full.py` pattern: core identity + tool hint + skill catalog.
+        """
         return (
-            f"You are a unified assistant at {_WORKDIR}. You handle coding, codebase exploration, "
-            "issue investigation (Jira/Bitbucket/Confluence), and team-based work (parallel "
-            "tasks/worktrees/teammates) from a single entry point.\n"
-            "Always respond in the same language the user writes in.\n\n"
-            "## Intent routing — pick the tool that matches the user's request\n"
-            "| Intent / 요청 유형                                | Primary tools |\n"
-            "| ------------------------------------------------- | ------------- |\n"
-            "| Search code / locate definition / 코드 찾기       | **grep, glob, fuzzy_find, ls, read_file** |\n"
-            "| Modify code / 수정                                | edit_file, write_file  (+ bash 검증) |\n"
-            "| Multi-step work / 여러 단계                       | **todo** |\n"
-            "| Delegate exploration / 독립 탐색 위임             | **task** |\n"
-            "| Issue investigation (Jira) / 유사 이슈·티켓       | **jira_task** |\n"
-            "| Commit/PR history (Bitbucket) / 코드 변경 이력    | **bitbucket_task** |\n"
-            "| Runbook / docs (Confluence) / 문서·런북           | **confluence_task** |\n"
-            "| Long command (build/test) / 장시간 명령           | **background_run** |\n"
-            "| Parallel / isolated branch / 병렬·격리 작업       | **worktree_create + worktree_run** |\n"
-            "| Persistent worker / 영속 팀메이트                 | **spawn_teammate** |\n"
-            "| Cross-session task board / 세션간 태스크 관리     | **task_create / task_list / task_update** |\n"
-            "| Anything else (env, git, run)                     | bash |\n\n"
-            "**Issue mode triggers**: \"현장 이슈\", \"장애\", \"버그 분석\", \"유사 사례\", \"incident\". "
-            "→ fire `jira_task` + `bitbucket_task` + `confluence_task` in parallel, then synthesize. "
-            "Final report structure: `## 이슈 요약` `## Jira` `## 코드 변경` `## 문서` `## 종합 판단`.\n"
-            "**Team mode triggers**: \"병렬로\", \"여러 일 동시에\", \"teammate\", \"격리\", \"worktree\". "
-            "→ `task_create` 로 work items 분해 → `worktree_create` 로 격리 → `spawn_teammate` 로 실행자 할당.\n"
-            "**Default (coding / Q&A)**: BASE + SEARCH 만 사용. 팀·이슈 툴 호출 금지.\n\n"
-            "## Core principles\n"
-            "- Never answer about this codebase from memory. Inspect actual files first.\n"
-            "- Use `compact` ONLY when the conversation is genuinely too long — never on short exchanges.\n\n"
-            "## Search tool cheat sheet\n"
-            "| Intent                          | Tool                      | Example |\n"
-            "| ------------------------------- | ------------------------- | ------- |\n"
-            "| content search (regex/string)   | **`grep`**                | grep(pattern='def foo', type='py') |\n"
-            "| find files by name pattern      | **`glob`**                | glob(pattern='**/*.py') |\n"
-            "| directory tree / structure      | **`ls`**                  | ls(path='.', depth=3) |\n"
-            "| find file when name is fuzzy    | **`fuzzy_find`**          | fuzzy_find(query='repl') |\n"
-            "| read one file                   | **`read_file`**           | read_file(path='utils/repl.py') |\n"
-            "| modify one file                 | `write_file` / `edit_file`| — |\n"
-            "| anything else (env, run, git)   | `bash`                    | bash(command='git log -n5') |\n\n"
-            "`grep` / `glob` / `ls` / `fuzzy_find` already respect .gitignore and skip "
-            "`.venv`, `__pycache__`, `node_modules`, `.git`, binaries, etc. — DO NOT use `bash grep` / "
-            "`bash find` / `bash ls` for code exploration: you'll drown in noise.\n\n"
-            "## Reasoning — before you call a tool\n"
-            "Briefly plan: what's the target? which tool? which pattern/filter narrows it fastest?\n"
-            "For 'where is X' questions: first `grep` or `fuzzy_find`, then `read_file` on hits. "
-            "For 'project structure': `ls` with depth 2–3, not a single-level directory listing. "
-            "For 'what does X do': grep to find the definition, then read the file around those line numbers.\n\n"
-            "## Use conversation context as pointers (ALWAYS do this first)\n"
-            "Before starting any new search, scan the prior turns:\n"
-            "- Did you or the user already mention a specific file? → `read_file` it FIRST.\n"
-            "- Did a prior `grep` locate a line number? → read around it, don't re-grep.\n"
-            "- Is the user's current question a follow-up to something already discussed? → assume same module.\n"
-            "The history is your cheat sheet — don't re-discover what's already answered.\n\n"
-            "## Query expansion — user intent ≠ code identifier (CRITICAL)\n"
-            "Natural-language intent rarely appears verbatim in code. Translate before searching:\n"
-            "  \"status bar\" / \"상태표시줄\"  → `status`, `statusline`, `status_line`, `status\\.`\n"
-            "  \"icon\" / \"아이콘\"            → `icon`, `ICON`, `_ICON`\n"
-            "  \"color\" / \"색상\"             → `color`, `#[0-9A-Fa-f]`, `theme`, `style`\n"
-            "  \"folder\" / \"폴더\"            → `folder`, `dir`, `directory`\n"
-            "  \"input\" / \"입력\"             → `input`, `buffer`, `prompt`\n"
-            "If a search returns `(no matches)`, IMMEDIATELY retry with at least 2 more variations "
-            "(translation, code-style identifier, abbreviated form) BEFORE concluding. "
-            "Korean concept? Try English code terms too, and vice versa.\n\n"
-            "## Tool output — completeness check (CRITICAL)\n"
-            "Every tool result MUST be checked before you use it:\n"
-            "- If output contains `[OUTPUT TRUNCATED`, `[TOOL RESULT TRUNCATED`, `[TRUNCATED at`, "
-            "ends with `…`, or mentions more items — the result is INCOMPLETE. Do NOT answer from it.\n"
-            "- Re-run with pagination / narrower scope: raise `head_limit`, use `output_mode='files_with_matches'` "
-            "first then drill down, add `glob`/`type` filter, narrow `path`, or increase `read_file`'s `limit`.\n\n"
-            "## Never ask the user to narrow scope before exhausting tools\n"
-            "\"I couldn't find it, could you clarify?\" is a failure — NOT a first response. Before asking, do ALL of:\n"
-            "  1. Check conversation context — read any files/identifiers already mentioned in prior turns\n"
-            "  2. Try 3+ grep variations (synonyms, translations, code-style identifiers)\n"
-            "  3. `ls` the top 2–3 candidate directories (utils/, src/, agent/, components/, …) and `read_file` the most promising hits\n"
-            "Only after this do you ask the user — and when you do, REPORT what you tried and what you found, "
-            "not a bare \"couldn't find\".\n\n"
-            "## Survey / exploration queries — \"related / 관련 / 전부 / list all / 모두\" (CRITICAL)\n"
-            "Questions like \"what's related to X?\", \"list all Y\", \"시스템 프롬프트 관련 파일들\", "
-            "\"해당 기능 전부\", \"related parts\" require a COMPREHENSIVE answer. Process:\n"
-            "  1. Multiple grep variations — at least 3 patterns (synonyms, code-style, translation).\n"
-            "  2. Read EACH hit file — not just the first one. A survey has multiple answers by definition.\n"
-            "  3. Categorize findings by purpose/role.\n"
-            "  4. Report each finding as `file:line — 1-line purpose` with at least 3 entries "
-            "(or fewer + explicit search trail: \"searched X/Y/Z, only N relevant\").\n"
-            "For broad surveys, consider `task(prompt='Find all X across the repo — list file:line + purpose per hit')` "
-            "to delegate exhaustive exploration to a subagent.\n\n"
-            "## Before emitting a final answer — thoroughness bar\n"
-            "Before replying, especially to survey/exploration/list queries, verify:\n"
-            "  ☐ 3+ search patterns attempted (if searching was needed)\n"
-            "  ☐ ≥2 candidate files actually read (not just grep matches)\n"
-            "  ☐ Answer cites concrete `file:line` references (not a single generic statement)\n"
-            "  ☐ For \"all X\" queries — answer lists multiple entries, not one\n"
-            "If any box is unchecked, iterate MORE before answering.\n\n"
-            "## After making code changes\n"
-            "MANDATORY: after every edit_file or write_file, run bash to verify — e.g. "
-            "`uv run python -c 'import <module>'`. Do NOT claim success without verification.\n\n"
-            "## When a command fails\n"
-            "Never ask the user how to proceed on command errors. Try alternatives yourself:\n"
-            "- Command not found → `uv run <cmd>` or `python -m <cmd>`\n"
-            "- Import error → `uv sync` or inspect installed packages\n"
-            "- Permission error → try a different approach\n"
-            "Exhaust at least 2–3 alternatives before telling the user you're blocked.\n\n"
-            "## Python environment\n"
-            f"This project uses `uv`. Run Python as `uv run python` or `uv run <tool>` at {_WORKDIR}.\n\n"
-            "## Skills — playbooks for recurring task types\n"
-            "Call `load_skill(name)` EARLY when the user's request matches a skill's description. "
-            "Skills give you concrete step-by-step procedures — load once, then follow. "
-            "Don't reinvent the process each time. Loading happens BEFORE the first exploration tool call, "
-            "not after you've already started.\n\n"
-            f"Available skills:\n{self.skills.catalog()}"
+            f"You are a unified assistant at {_WORKDIR}. Coding, codebase exploration, "
+            "Jira/Bitbucket/Confluence issue investigation, team/worktree work — one entry point.\n"
+            "Respond in the user's language.\n\n"
+            "## Tool selection\n"
+            "- Code search  → grep / glob / ls / fuzzy_find   (gitignore-aware; NEVER bash grep/find/ls)\n"
+            "- Code edit    → edit_file / write_file          (verify with bash after)\n"
+            "- Delegate     → task (general) / jira_task / bitbucket_task / confluence_task\n"
+            "- Multi-step   → todo   (cross-session board → task_create / task_list / task_update)\n"
+            "- Long command → background_run\n"
+            "- Parallel     → worktree_create + worktree_run\n"
+            "- Persistent   → spawn_teammate\n"
+            "- Escape hatch → bash   (env, git, run — NOT for code exploration)\n\n"
+            "## Core rules\n"
+            "- Never answer about this codebase from memory — inspect files first.\n"
+            "- Scan prior turns before any new search: files/line-numbers already mentioned are pointers.\n"
+            "- On search miss / truncated output / survey queries (\"list all\", \"관련 전부\") "
+            "→ `load_skill(\"search-iteration\")` before giving up or asking the user to narrow scope.\n"
+            "- After `edit_file`/`write_file` → verify with bash (e.g. `uv run python -c 'import X'`).\n"
+            "- On command failure → try 2–3 alternatives (`uv run <cmd>`, `python -m <cmd>`, `uv sync`) before blocking.\n"
+            "- Use `compact` only when the conversation is genuinely too long.\n"
+            "\n"
+            "## Evidence-grounded answers (CRITICAL)\n"
+            "Behavioral questions (\"어떻게 동작?\", \"X 하면 어떻게 돼?\") MUST be answered by "
+            "**tracing actual code**, not by describing what looks plausible.\n"
+            "- Every factual claim about behavior should point to `file:line` you actually read.\n"
+            "- **Forbidden speculative patterns** (red flags): \"~일 수 있습니다\", \"~일 것입니다\", "
+            "\"아마도\", \"could\", \"may\", \"should work\", \"probably\". If you use these, you have NOT "
+            "verified — either verify or say \"이 부분은 확인하지 않았습니다\".\n"
+            "- **Trace pattern** for \"how does X behave when Y\" questions:\n"
+            "  1. `grep` for the feature's **core class/function** (not the orchestrator/loop plumbing).\n"
+            "     e.g. \"Bitbucket 키 잘못되면?\" → `grep 'class BitbucketClient'`, NOT `grep 'bitbucket'`.\n"
+            "  2. `read_file` the core implementation at the relevant section.\n"
+            "  3. Follow the specific code path for the condition (error branch, config check, etc.).\n"
+            "  4. Quote the actual code in your answer. Don't paraphrase unless necessary.\n"
+            "- Plumbing files (`orchestrator.py`, `loop.py`, `main.py`) describe **routing**, not behavior.\n"
+            "  If the user asks about feature behavior, do NOT fixate on plumbing.\n"
+            "- **One-line summaries after extensive research = unacceptable**. If you read 10 files/chunks "
+            "to answer, your reply must reflect that work. Short answer like \"X 방식으로 처리됩니다\" "
+            "without specifics wastes the user's research budget. Either give the details you found, "
+            "or admit you couldn't locate them.\n"
+            "\n"
+            "## Plan & progress tracking (CRITICAL)\n"
+            "- A plan may be pre-drafted for you (see Todo section in the live region). Follow it.\n"
+            "- **Don't re-read the same file chunk you already saw** — check prior tool results first. "
+            "Re-reading identical offsets = you've lost track; step back and synthesize.\n"
+            "- For large files (>300 lines), use `grep(pattern=..., path='X')` to locate sections "
+            "BEFORE sequential `read_file` pagination. Sequential reads are for short files or "
+            "when you already know what you're looking for.\n"
+            "- **MANDATORY when a plan exists**: before your final assistant reply, you MUST call "
+            "`todo(items=[...])` AT LEAST ONCE to reflect reality — mark each finished step as "
+            "`completed`, advance the next step to `in_progress`. If a step turned out unnecessary, "
+            "mark it `completed` with a note in your reply. **Skipping this leaves the plan looking "
+            "unfinished to the user — that is a user-facing bug.**\n"
+            "- **Don't announce and stop.** A reply like \"이제 X 하겠습니다\" / \"I'll do X next\" "
+            "followed by `stop` = you gave up mid-plan. Either execute X NOW via tool calls, or mark "
+            "it completed with a one-line justification. Announcements without action are treated as a bug.\n"
+            "- If the plan was wrong or incomplete, revise via `todo(items=[...])` — don't just ignore it.\n\n"
+            f"## Python\n`uv run python` / `uv run <tool>` at {_WORKDIR}.\n\n"
+            "## Skills — load early with `load_skill(name)` when the request matches\n"
+            f"{self.skills.catalog()}"
+        )
+
+    def _system_prompt(self) -> str:
+        """Back-compat accessor — returns the cached prompt built in __init__."""
+        return self._cached_system_prompt
+
+    def _parent_plan_context(self) -> str:
+        """현재 parent todo 중 in_progress item 이 있으면 context block 반환.
+        Subagent 가 부모의 어느 step 을 실행하는 중인지 알면 scope 이탈 방지."""
+        items = self.planner.state.items
+        if not items:
+            return ""
+        active = next((i for i in items if i.status == "in_progress"), None)
+        if not active:
+            return ""
+        total = len(items)
+        done = sum(1 for i in items if i.status == "completed")
+        return (
+            "\n## Parent plan context\n"
+            f"부모 에이전트의 plan: {done}/{total} 완료, 현재 진행 중 단계는\n"
+            f"  → **{active.content}**\n"
+            "이 delegated task 는 그 단계의 일부다. 스코프 이탈 말고 필요한 증거만 모아서 리턴.\n"
         )
 
     def _subagent_system_prompt(self) -> str:
-        return (
+        return self._parent_plan_context() + (
             f"/no_think\nYou are a coding subagent at {_WORKDIR}.\n"
             "Complete the delegated task using tools, then return a structured report.\n\n"
             "## Tool selection (pick the right tool, not just bash)\n"
@@ -384,7 +443,7 @@ class OrchestratorAgent:
             )
         else:
             body = f"/no_think\nYou are an investigation subagent ({source}) at {_WORKDIR}.\n"
-        return body + common_tail
+        return self._parent_plan_context() + body + common_tail
 
     # ── Extra-handler implementations ────────────────────────────────────────
 
@@ -404,6 +463,7 @@ class OrchestratorAgent:
             registry=self.registry,
             system=self._subagent_system_prompt(),
             description=description,
+            cancel_event=self.cancel_event,
         )
 
     def _handle_jira_task(self, prompt: str) -> str:
@@ -415,6 +475,7 @@ class OrchestratorAgent:
             system=self._issue_subagent_prompt("jira"),
             description="jira",
             tools=definitions.JIRA_TOOLS,
+            cancel_event=self.cancel_event,
         )
 
     def _handle_bitbucket_task(self, prompt: str) -> str:
@@ -426,6 +487,7 @@ class OrchestratorAgent:
             system=self._issue_subagent_prompt("bitbucket"),
             description="bitbucket",
             tools=definitions.BITBUCKET_TOOLS,
+            cancel_event=self.cancel_event,
         )
 
     def _handle_confluence_task(self, prompt: str) -> str:
@@ -437,6 +499,7 @@ class OrchestratorAgent:
             system=self._issue_subagent_prompt("confluence"),
             description="confluence",
             tools=definitions.CONFLUENCE_TOOLS,
+            cancel_event=self.cancel_event,
         )
 
     def _handle_compact(self, focus: str | None = None) -> str:
@@ -449,8 +512,16 @@ class OrchestratorAgent:
 
     # ── Main entry point ─────────────────────────────────────────────────────
 
+    def cancel(self) -> None:
+        """Signal cooperative cancellation. The current turn's agent_loop and
+        any nested subagents will exit at the next turn boundary / tool dispatch.
+        In-flight LLM HTTP calls complete normally (their result is discarded)."""
+        self.cancel_event.set()
+
     def run(self, user_input: str) -> str:
         """Process one user message and return the final assistant reply."""
+        # Fresh turn — clear any leftover cancel from a prior run.
+        self.cancel_event.clear()
         self.history.append({"role": "user", "content": user_input})
 
         # Drain background notifications before the next model call (s08)
@@ -470,22 +541,99 @@ class OrchestratorAgent:
                 self.history, self.compact_state, self.main_model
             )
 
-        state = LoopState(messages=self.history)
+        # Intent router — main 모델로 분류해서 tier 별 tools 만 노출.
+        # compact 이후 호출 → 라우터가 받는 history tail 도 이미 정돈된 상태.
+        set_activity("routing intent…")
+        try:
+            route = classify_intent(
+                user_msg=user_input,
+                history_tail=self.history[-6:-1],  # 방금 append 한 user 제외한 직전 교환
+                main_model=self.main_model,
+            )
+        finally:
+            clear_activity()
+        tools = definitions.tools_for_tier(route.intents)
+        # bullet point 실시간 로그 — tool call 과 동일한 `⎿` 스타일
+        fallback_tag = " [fallback]" if route.fallback else ""
+        print_tool_call(
+            "router",
+            f"{route.label()} → {len(tools)} tools  ({route.latency_ms}ms){fallback_tag}",
+        )
+
+        # Router 가 plan 을 함께 뽑았으면 TodoManager 에 바로 주입 + 라이브 리전 노출.
+        # 첫 step 은 자동으로 in_progress 로 승격 — 모델이 "어디서부터 시작?" 헤매지 않게.
+        if route.plan:
+            items = [{"content": s, "status": "pending", "active_form": s} for s in route.plan]
+            items[0]["status"] = "in_progress"
+            self._handle_todo(items)  # planner.update + display_set_todos 모두 처리
+            print_tool_call("router", f"plan drafted: {len(route.plan)} steps")
+
+        # Depth-dive 의도 키워드 ("자세히", "설명해", "in depth" 등) 감지 시에만
+        # 시스템 프롬프트에 depth mode 절 첨부. 짧은 질문은 기존대로 간결 응답.
+        # 기본 프롬프트는 byte-identical 하게 캐시되고 appendix 만 turn-local.
+        system_prompt = self._system_prompt()
+        if _has_depth_signal(user_input):
+            system_prompt += _DEPTH_APPENDIX
+            print_tool_call("router", "depth mode enabled")
+
+        state = LoopState(messages=self.history, cancel_event=self.cancel_event)
         agent_loop(
             state=state,
             model=self.main_model,
-            tools=definitions.UNIFIED_TOOLS,
+            tools=tools,
             registry=self.registry,
-            system=self._system_prompt(),
+            system=system_prompt,
             extra_handlers=self._extra_handlers,
+            stream_to_console=True,  # 라이브 리전에 토큰 스트림, 최종은 print_assistant 가 커밋
+            permissions=self.permissions,  # 파괴적 tool 은 사용자 승인 경유
         )
 
+        # Plan 감사 — 이번 턴에 router 가 plan 을 draft 했는데 planner 에 non-completed
+        # 항목이 남아있으면 "plan 미완료" 상태. 모델에 합성 user 메시지로 continuation
+        # 요청 후 한 번 더 짧게 돌림.
+        #
+        # 조건에서 `not state.todo_called` 뺌 — 모델이 todo 한 번 부르고 "이제 X 하겠습니다"
+        # 선언 후 stop 하는 패턴이 대표적 누락 케이스라, todo 호출 여부와 무관하게
+        # plan 완료 여부 자체를 기준으로 삼음. `route.plan` 로 "이번 턴에 새로 draft 됐는지"
+        # 체크해서 과거 턴의 잔여 plan 은 nudge 대상 제외 (사용자가 무관한 주제로 넘어간 경우).
+        plan_drafted_this_turn = bool(route.plan)
+        incomplete = [i for i in self.planner.state.items if i.status != "completed"]
+        if plan_drafted_this_turn and incomplete:
+            lines = "\n".join(f"  - [{i.status}] {i.content}" for i in self.planner.state.items)
+            self.history.append({
+                "role": "user",
+                "content": (
+                    "[SYSTEM audit — plan incomplete]\n"
+                    "Current plan:\n"
+                    f"{lines}\n\n"
+                    "Do NOT end the turn with only 'I'll do X next' — that's an announcement, not execution.\n"
+                    "Choose ONE:\n"
+                    "  (A) Execute the remaining steps NOW via tool calls, then mark them completed.\n"
+                    "  (B) If a step is genuinely not applicable, mark it completed in `todo()` "
+                    "with a one-line justification in your final reply.\n"
+                    "  (C) If the work genuinely needs user input to proceed, mark what's done and ask "
+                    "ONE specific question.\n"
+                    "Don't re-do completed work. Don't speculate — keep answers evidence-grounded."
+                ),
+            })
+            nudge_state = LoopState(
+                messages=self.history,
+                cancel_event=self.cancel_event,
+            )
+            agent_loop(
+                state=nudge_state,
+                model=self.main_model,
+                tools=tools,
+                registry=self.registry,
+                system=system_prompt,
+                extra_handlers=self._extra_handlers,
+                stream_to_console=True,
+                permissions=self.permissions,
+                max_turns=10,  # 실제 남은 step 실행하려면 여유 필요 (grep/read/analyze 조합)
+            )
+
         # Track whether todo was updated this turn for the planner nudge
-        used_todo = any(
-            tc.get("function", {}).get("name") == "todo"
-            for msg in self.history
-            for tc in (msg.get("tool_calls") or [])
-        )
+        used_todo = state.todo_called
         self.planner.note_round(used_todo=used_todo)
 
         # Return last non-empty assistant reply

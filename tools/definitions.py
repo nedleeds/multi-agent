@@ -30,12 +30,17 @@ READ_FILE = {
     "type": "function",
     "function": {
         "name": "read_file",
-        "description": "Read the contents of a file.",
+        "description": (
+            "Read file contents, optionally paginated. For large files, use `limit` + "
+            "`offset` to scroll through sections. Truncation hint will tell you the "
+            "next offset value to use."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "limit": {"type": "integer", "description": "Max lines to return"},
+                "path":   {"type": "string"},
+                "limit":  {"type": "integer", "description": "Max lines to return (0/omit = until EOF)"},
+                "offset": {"type": "integer", "description": "Start line (0-indexed, default 0)"},
             },
             "required": ["path"],
         },
@@ -937,3 +942,36 @@ UNIFIED_TOOLS = (
     + _PROTOCOL_TOOLS                                  # s10
     + _WORKTREE_TOOLS                                  # s12
 )
+
+
+# ── Intent 기반 tool tier 선택 ────────────────────────────────────────────────
+# Router (agent/router.py) 가 user turn 마다 intent 집합을 반환하면 이 헬퍼가
+# 해당 tier 에 맞는 tools 만 고른다. CHAT 만 있으면 tools 없이 즉답.
+
+VALID_INTENTS = {"CHAT", "CODING", "ISSUE", "TEAM"}
+
+
+def tools_for_tier(tier: set[str]) -> list[dict]:
+    """Intent 집합 → 필요한 OpenAI-format tool schema 리스트.
+
+    - `{CHAT}` 또는 빈 집합       → `[]`  (잡담 · 메타 질문 즉답)
+    - 기술적 intent 가 하나라도    → `BASE_TOOLS + [TODO, LOAD_SKILL, TASK, COMPACT]`
+    - `ISSUE` 추가                → Jira/BB/Confluence task delegation
+    - `TEAM` 추가                 → task graph · background · team · protocol · worktree
+    """
+    clean = tier & VALID_INTENTS
+    if not clean or clean == {"CHAT"}:
+        return []
+
+    tools: list[dict] = list(BASE_TOOLS) + [TODO, LOAD_SKILL, TASK, COMPACT]
+    if "ISSUE" in clean:
+        tools += [JIRA_TASK, BITBUCKET_TASK, CONFLUENCE_TASK]
+    if "TEAM" in clean:
+        tools += (
+            _TASK_GRAPH_TOOLS
+            + _BACKGROUND_TOOLS
+            + _TEAM_TOOLS
+            + _PROTOCOL_TOOLS
+            + _WORKTREE_TOOLS
+        )
+    return tools

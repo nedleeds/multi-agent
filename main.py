@@ -40,7 +40,12 @@ def main() -> None:
         mode="unified",
         main_model=main_model.config.model_id,
         sub_model=sub_model.config.model_id,
-    ).run(agent_fn=agent.run, on_clear=on_clear)
+    ).run(
+        agent_fn=agent.run,
+        on_clear=on_clear,
+        on_cancel=agent.cancel,
+        permissions=agent.permissions,  # 파괴적 tool 승인 브릿지
+    )
 
 
 if __name__ == "__main__":

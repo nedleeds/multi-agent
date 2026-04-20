@@ -8,8 +8,7 @@ agent 실행은 백그라운드 executor 에서 돌리면서 patch_stdout 으로
 import asyncio
 import os
 import re
-import subprocess
-import time
+import sys
 from typing import Callable
 
 from prompt_toolkit import Application
@@ -38,6 +37,7 @@ from .console import (
     task_board,
     thinking_spinner,
 )
+from .error_log import log_exception
 
 # amber 계열 — agent 아이콘과 대비
 _USER_ICON  = "\uf007"          # Nerd Font person
@@ -45,143 +45,28 @@ _USER_COLOR = "#7DBBE8"         # 하늘색 — agent amber(#FF8000)와 대비
 
 # 상태줄 nerd font 아이콘
 _FOLDER_ICON    = "\uf07c"          #   (folder-open)
-_BRANCH_ICON    = "\ue0a0"          #   (powerline branch)
 _AGENT_ICON     = "󰚩 "      # 󰚩  (md-robot — print_assistant와 동일)
-# git status 아이콘 (starship 스타일)
-_STAGED_ICON    = "\U000F107A"      # 󱁺  staged
-_MODIFIED_ICON  = "\uf448"          #   modified
-_REMOVED_ICON   = "\uf48e"          #   deleted
-_RENAMED_ICON   = "\U000F0541"      # 󰕁  renamed
-_UNTRACKED_ICON = "\uf128"          #   untracked
-_CONFLICT_ICON  = "\uf467"          #   conflict
-_AHEAD_ICON     = "\U000F1DA3"      # 󰶣  ahead
-_BEHIND_ICON    = "\U000F1DA1"      # 󰶡  behind
 
 _STYLE = Style.from_dict({
-    "user-icon":          f"{_USER_COLOR} bold",
-    "hint":               "dim",
-    "input":              "",
-    "slash-cmd":          "#5FD7AF bold",  # 명령어와 정확히 일치할 때 강조
-    # 상태줄 — 항목별 아이콘은 강조색, 본문은 가독성 높은 색
-    "status.folder-icon": "#FFD700",        # amber
-    "status.folder":      "#E4E4E4 bold",
-    "status.branch-icon": "#5FAFFF",        # 파랑
-    "status.branch":      "#E4E4E4 bold",   # 흰색
-    "status.added":       "#5FD787 bold",   # +N — 녹색 강조
-    "status.deleted":     "#FF5F5F bold",   # -N — 빨강 강조
-    # git status (file-level) — 모두 짙은 회색
-    "status.staged":      "#6C6C6C",
-    "status.modified":    "#6C6C6C",
-    "status.removed":     "#6C6C6C",
-    "status.renamed":     "#6C6C6C",
-    "status.untracked":   "#6C6C6C",
-    "status.conflicts":   "#6C6C6C",
-    "status.ahead":       "#6C6C6C",
-    "status.behind":      "#6C6C6C",
-    "status.agent-icon":  "#CC785C bold",   # Claude amber — print_assistant와 동일
-    "status.main":        "#E4E4E4 bold",
-    "status.sub":         "#E4E4E4",
-    "status.tag":         "#8A8A8A",        # (main)/(sub) 라벨 — 약하게
+    "user-icon": f"{_USER_COLOR} bold",
+    "hint":      "dim",
+    "input":     "",
+    "slash-cmd": "#5FD7AF bold",  # 명령어와 정확히 일치할 때 강조
 })
 
 _SLASH_COMMANDS: dict[str, str] = {
-    "/help":  "슬래시 명령어 목록 표시",
-    "/clear": "화면 초기화 (대화 기록 유지)",
-    "/exit":  "종료",
+    "/help":    "슬래시 명령어 목록 표시",
+    "/clear":   "화면 초기화 (대화 기록 유지)",
+    "/models":  "현재 세션의 cwd + main/sub 모델 배너 재출력",
+    "/cancel":  "실행 중인 턴 중단 (다음 턴 경계에서)",
+    "/killall": "즉시 모든 agent 중단 + 프로세스 종료 (강제)",
+    "/exit":    "종료",
 }
 
 # 슬래시 명령어 토큰 — 양옆이 공백/경계여야 매칭 (예: "/exit", " /exit", "/exit ")
 _CMD_PATTERN = re.compile(
     r"(?<!\S)(?:" + "|".join(re.escape(c) for c in _SLASH_COMMANDS) + r")(?!\S)"
 )
-
-
-def _git_stats() -> dict:
-    """현재 디렉토리 git 정보. 실패하면 빈 값."""
-    empty = {
-        "branch": "", "added": 0, "deleted": 0,
-        "staged": 0, "modified": 0, "removed": 0,
-        "untracked": 0, "renamed": 0, "conflicts": 0,
-        "ahead": 0, "behind": 0,
-    }
-    try:
-        branch = subprocess.run(
-            ["git", "branch", "--show-current"],
-            capture_output=True, text=True, timeout=0.5,
-        ).stdout.strip()
-        if not branch:
-            return empty
-
-        # HEAD 대비 전체 +/- 라인 수 — 한 번의 `git diff HEAD --numstat` 로 계산.
-        # 이전 방식(unstaged + staged 합)은 동일 라인이 양쪽 diff 에 모두 잡히면
-        # 중복 카운트돼서 실제보다 과다 집계됨.
-        added = deleted = 0
-        out = subprocess.run(
-            ["git", "diff", "HEAD", "--numstat"],
-            capture_output=True, text=True, timeout=0.5,
-        ).stdout
-        for line in out.splitlines():
-            parts = line.split("\t")
-            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-                added += int(parts[0])
-                deleted += int(parts[1])
-
-        # 파일 단위 status 카운트 (porcelain v1)
-        staged = modified = removed = untracked = renamed = conflicts = 0
-        out = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, text=True, timeout=0.5,
-        ).stdout
-        for line in out.splitlines():
-            if len(line) < 2:
-                continue
-            xy = line[:2]
-            x, y = xy[0], xy[1]
-            if xy == "??":
-                untracked += 1
-                continue
-            if "U" in xy or xy in ("AA", "DD"):
-                conflicts += 1
-                continue
-            if x == "R":
-                renamed += 1
-            if x in "MADRC":
-                staged += 1
-            if y == "M":
-                modified += 1
-            if y == "D":
-                removed += 1
-
-        # ahead/behind
-        ahead = behind = 0
-        out = subprocess.run(
-            ["git", "rev-list", "--left-right", "--count", "@{u}...HEAD"],
-            capture_output=True, text=True, timeout=0.5,
-        ).stdout.strip()
-        if out:
-            cols = out.split()
-            if len(cols) == 2 and cols[0].isdigit() and cols[1].isdigit():
-                behind, ahead = int(cols[0]), int(cols[1])
-
-        return {
-            "branch": branch, "added": added, "deleted": deleted,
-            "staged": staged, "modified": modified, "removed": removed,
-            "untracked": untracked, "renamed": renamed, "conflicts": conflicts,
-            "ahead": ahead, "behind": behind,
-        }
-    except Exception:
-        return empty
-
-
-_GIT_CACHE: dict = {"ts": 0.0, "data": _git_stats.__defaults__ or {}}
-
-
-def _cached_git_stats() -> dict:
-    now = time.time()
-    if now - _GIT_CACHE["ts"] > 2.0:
-        _GIT_CACHE["data"] = _git_stats()
-        _GIT_CACHE["ts"] = now
-    return _GIT_CACHE["data"]
 
 
 class _SlashCommandLexer(Lexer):
@@ -217,7 +102,10 @@ class REPLSession:
         self._sub_model      = sub_model
         self._agent_fn: Callable[[str], str] | None = None
         self._on_clear: Callable[[], None] | None   = None
+        self._on_cancel: Callable[[], None] | None  = None
         self._agent_running: bool                   = False
+        # 파괴적 tool 승인 브릿지 — run() 시 전달받음. 없으면 승인 게이트 disabled.
+        self._permissions = None
 
         self._buf = Buffer(
             name="input",
@@ -241,67 +129,6 @@ class REPLSession:
             return FormattedText([
                 ("class:user-icon", f" {_USER_ICON}  "),
             ])
-
-        def _status_line() -> FormattedText:
-            cwd = os.getcwd()
-            home = os.path.expanduser("~")
-            if cwd == home:
-                path = "~"
-            elif cwd.startswith(home + os.sep):
-                path = "~" + cwd[len(home):]
-            else:
-                path = cwd
-
-            stats = _cached_git_stats()
-            branch = stats["branch"]
-
-            parts: list[tuple[str, str]] = []
-            parts.append(("class:status.folder-icon", f" {_FOLDER_ICON}  "))
-            parts.append(("class:status.folder", path))
-            if branch:
-                parts.append(("", "   "))
-                parts.append(("class:status.branch-icon", f"{_BRANCH_ICON} "))
-                parts.append(("class:status.branch", branch))
-
-                # 파일 단위 status (starship 순서: conflicts, removed, renamed, modified, staged, untracked, ahead, behind)
-                file_segs = (
-                    ("conflicts", _CONFLICT_ICON,  "class:status.conflicts"),
-                    ("removed",   _REMOVED_ICON,   "class:status.removed"),
-                    ("renamed",   _RENAMED_ICON,   "class:status.renamed"),
-                    ("modified",  _MODIFIED_ICON,  "class:status.modified"),
-                    ("staged",    _STAGED_ICON,    "class:status.staged"),
-                    ("untracked", _UNTRACKED_ICON, "class:status.untracked"),
-                    ("ahead",     _AHEAD_ICON,     "class:status.ahead"),
-                    ("behind",    _BEHIND_ICON,    "class:status.behind"),
-                )
-                segments: list[list[tuple[str, str]]] = []
-                for key, icon, cls in file_segs:
-                    n = stats[key]
-                    if n > 0:
-                        segments.append([(cls, f"{icon} {n}")])
-                if stats["added"]:
-                    segments.append([("class:status.added", f"+{stats['added']}")])
-                if stats["deleted"]:
-                    segments.append([("class:status.deleted", f"-{stats['deleted']}")])
-
-                if segments:
-                    parts.append(("", "("))
-                    for i, seg in enumerate(segments):
-                        if i > 0:
-                            parts.append(("", ", "))
-                        parts.extend(seg)
-                    parts.append(("", ")"))
-            if self._main_model:
-                parts.append(("", "   "))
-                parts.append(("class:status.agent-icon", f"{_AGENT_ICON} "))
-                parts.append(("class:status.main", self._main_model))
-                parts.append(("class:status.tag", "(main)"))
-            if self._sub_model:
-                parts.append(("", "   "))
-                parts.append(("class:status.agent-icon", f"{_AGENT_ICON} "))
-                parts.append(("class:status.sub", self._sub_model))
-                parts.append(("class:status.tag", "(sub)"))
-            return FormattedText(parts)
 
         hint_processor = ConditionalProcessor(
             AfterInput("  ↵ send · Alt+↵ newline · /help", style="class:hint"),
@@ -328,11 +155,6 @@ class REPLSession:
                     ),
                     filter=Condition(display_is_active),
                 ),
-                Window(
-                    content=FormattedTextControl(_status_line),
-                    height=1,
-                    dont_extend_height=True,
-                ),
                 VSplit([
                     Window(
                         content=FormattedTextControl(_prompt_line),
@@ -354,6 +176,33 @@ class REPLSession:
             ]),
             focused_element=self._buf,
         )
+
+    # ── banner ────────────────────────────────────────────────────────────────
+
+    def _print_banner(self) -> None:
+        """cwd + main/sub 모델명을 rich markup 으로 한 줄 출력.
+        시작 시, `/clear` 후, `/models` 호출 시 사용. 스타일은 _STYLE 의 status.* 와 맞춤.
+        """
+        cwd = os.getcwd()
+        home = os.path.expanduser("~")
+        if cwd == home:
+            path = "~"
+        elif cwd.startswith(home + os.sep):
+            path = "~" + cwd[len(home):]
+        else:
+            path = cwd
+
+        parts = [f"[#FFD700] {_FOLDER_ICON}  [/][bold #E4E4E4]{path}[/]"]
+        if self._main_model:
+            parts.append(
+                f"[bold #CC785C]{_AGENT_ICON} [/][bold #E4E4E4]{self._main_model}[/][#8A8A8A](main)[/]"
+            )
+        if self._sub_model:
+            parts.append(
+                f"[bold #CC785C]{_AGENT_ICON} [/][#E4E4E4]{self._sub_model}[/][#8A8A8A](sub)[/]"
+            )
+        console.print("   ".join(parts))
+        console.print()
 
     # ── key bindings ──────────────────────────────────────────────────────────
 
@@ -390,14 +239,52 @@ class REPLSession:
         if not line:
             return False
 
-        # agent 가 돌고 있는 동안엔 새 입력 무시 (버퍼는 이미 비웠으므로 무해)
-        if self._agent_running:
+        # Pending permission 이 있으면 agent 쓰레드가 Future 에서 blocking 중.
+        # 다른 커맨드 처리하지 않고 y/n/d/a 로 해석 → PermissionManager 에 통지.
+        perm = self._permissions
+        if perm is not None and perm.has_pending():
+            key = line.lower().strip()
+            if key in ("y", "yes", "승인"):
+                perm.approve()
+                run_in_terminal(lambda: console.print("[dim]  ✓ approved[/dim]"))
+            elif key in ("n", "no", "거부"):
+                perm.deny("declined by user")
+                run_in_terminal(lambda: console.print("[dim]  ✗ denied[/dim]"))
+            elif key in ("d", "diff", "detail"):
+                perm.toggle_full_diff()
+            elif key in ("a", "auto"):
+                perm.enable_auto_session()
+                run_in_terminal(lambda: console.print(
+                    "[info]  ✓ auto-approved (세션 내내 동일 tool 자동승인)[/info]"
+                ))
+            else:
+                run_in_terminal(lambda: console.print(
+                    "[dim]  [y] 승인 · [n] 거부 · [d] 전체 diff · [a] 자동승인[/dim]"
+                ))
             return True
 
-        if line == "/exit":
-            self._app.exit()
+        # /killall — 즉시 종료. 협조적 취소를 기다리지 않고 프로세스를 끝낸다.
+        # 실행 중이든 아니든 동작해야 하므로 _agent_running 체크 이전에 처리.
+        # 서브에이전트/백그라운드/팀메이트 스레드는 전부 daemon 이라 os._exit 로 함께 정리됨.
+        # run_in_terminal 은 async 라 os._exit 이전에 출력되지 않을 수 있어 stderr 직접 기록.
+        if line == "/killall":
+            sys.stderr.write("\n⏻  /killall — terminating immediately\n")
+            sys.stderr.flush()
+            os._exit(130)
+
+        # /cancel 은 agent 가 돌고 있을 때만 의미 있음 — running 체크 이전에 처리
+        if line == "/cancel":
+            if self._agent_running and self._on_cancel:
+                self._on_cancel()
+                run_in_terminal(lambda: console.print(
+                    "[info] ⏹  /cancel requested — exiting at next turn boundary[/info]"
+                ))
+            else:
+                run_in_terminal(lambda: console.print("[dim](nothing running)[/dim]"))
             return True
 
+        # UI 전용 메타 커맨드 — agent 실행 중이든 유휴든 즉시 처리.
+        # 에이전트 상태를 변경하지 않고 scrollback 에만 출력하므로 안전.
         if line == "/help":
             def _show():
                 from rich.table import Table
@@ -409,9 +296,22 @@ class REPLSession:
             run_in_terminal(_show)
             return True
 
+        if line == "/models":
+            run_in_terminal(self._print_banner)
+            return True
+
+        # agent 가 돌고 있는 동안엔 나머지 입력 무시 (새 턴/clear/exit 는 경계에서만)
+        if self._agent_running:
+            return True
+
+        if line == "/exit":
+            self._app.exit()
+            return True
+
         if line == "/clear":
             def _clear():
                 console.clear()
+                self._print_banner()
                 if self._on_clear:
                     self._on_clear()
             run_in_terminal(_clear)
@@ -456,6 +356,9 @@ class REPLSession:
         agent_fn = self._agent_fn
         if agent_fn is None:
             return
+        # 턴 경계 — scrollback 에서 각 사용자 입력이 시작점임을 한 눈에 보이게.
+        # 풀 너비 dim rule 을 쓰지 않고 짧은 회색 선으로 시각 노이즈 최소화.
+        console.rule(style="#3A3A3A", characters="─", align="left")
         # 사용자 입력 표시 — bg를 어둡게, 텍스트는 하늘색으로 agent 응답과 구분
         console.print(
             f"[bold {_USER_COLOR}] {_USER_ICON} [/bold {_USER_COLOR}]"
@@ -465,12 +368,22 @@ class REPLSession:
             task_board.reset()
             with thinking_spinner():
                 reply = agent_fn(line)
+            # 스트리밍은 라이브 리전(ephemeral)에서만 — turn 끝나면 지워짐.
+            # 최종 답변의 markdown-rendered 본문은 여기서 scrollback 에 커밋.
             if reply:
                 print_assistant(reply)
         except KeyboardInterrupt:
             print_info("[취소됨]")
         except Exception as exc:
-            print_error(str(exc))
+            # 한 줄 요약만 찍고 전체 traceback + context 는 파일로.
+            # exception 에 _agent_ctx 가 붙어있으면 model_id/base_url/turn 등 포함.
+            log_path = log_exception(exc)
+            print_error(f"{type(exc).__name__}: {exc}")
+            ctx = getattr(exc, "_agent_ctx", None)
+            if isinstance(ctx, dict):
+                detail = "  ".join(f"{k}={v}" for k, v in ctx.items())
+                print_error(f"  ctx: {detail}")
+            print_error(f"  full traceback → {log_path}")
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -478,11 +391,16 @@ class REPLSession:
         self,
         agent_fn: Callable[[str], str],
         on_clear: Callable[[], None] | None = None,
+        on_cancel: Callable[[], None] | None = None,
+        permissions=None,
     ) -> None:
-        self._agent_fn = agent_fn
-        self._on_clear = on_clear
-        # 시작 시 화면 초기화 — 입력창이 항상 최상단에서 시작
+        self._agent_fn    = agent_fn
+        self._on_clear    = on_clear
+        self._on_cancel   = on_cancel
+        self._permissions = permissions
+        # 시작 시 화면 초기화 + 배너 한 번 출력 — 이후는 /models 로 on-demand 재호출
         console.clear()
+        self._print_banner()
         if on_clear:
             on_clear()
         self._app.run()

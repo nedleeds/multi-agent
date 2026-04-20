@@ -18,6 +18,7 @@ a text summary PLUS a compact evidence trail of its tool calls to the parent.
 
 import json
 import time
+from threading import Event
 
 from model.base import BaseLLM
 from tools import definitions
@@ -94,11 +95,13 @@ def run_subagent(
     system: str,
     description: str = "subtask",
     tools: list[dict] | None = None,
+    cancel_event: Event | None = None,
 ) -> str:
     """Run a subagent with fresh context and return summary + evidence.
 
     tools: tool schemas to give the subagent (default: CHILD_TOOLS).
            Pass API-specific tool sets for specialized subagents.
+    cancel_event: shared with the parent so /cancel propagates into nested loops.
     """
     tool_schemas = tools if tools is not None else definitions.CHILD_TOOLS
     tool_names   = [t["function"]["name"] for t in tool_schemas]
@@ -115,7 +118,10 @@ def run_subagent(
 
     start_time       = time.time()
     tokens_before_in, tokens_before_out = token_snapshot()
-    state            = LoopState(messages=[{"role": "user", "content": prompt}])
+    state            = LoopState(
+        messages=[{"role": "user", "content": prompt}],
+        cancel_event=cancel_event,
+    )
     error_message    = None
 
     try:

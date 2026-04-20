@@ -9,8 +9,16 @@ import threading
 import uuid
 from pathlib import Path
 
+from utils.shell import run_shell
+
 WORKDIR = Path.cwd()
-_DANGEROUS = ["rm -rf /", "sudo rm", "shutdown", "reboot", "> /dev/"]
+_DANGEROUS = [
+    # Unix
+    "rm -rf /", "sudo rm", "shutdown", "reboot", "> /dev/",
+    # Windows (PowerShell / cmd)
+    "Format-Volume", "Remove-Item -Recurse -Force C:\\",
+    "rmdir /s", "del /s /q C:\\",
+]
 
 
 class BackgroundManager:
@@ -46,10 +54,8 @@ class BackgroundManager:
 
     def _execute(self, task_id: str, command: str):
         try:
-            r = subprocess.run(
-                command, shell=True, cwd=WORKDIR,
-                capture_output=True, text=True, timeout=300,
-            )
+            # run_shell: Unix → /bin/sh, Windows → PowerShell
+            r = run_shell(command, cwd=WORKDIR, timeout=300)
             output = (r.stdout + r.stderr).strip()[:50_000]
         except subprocess.TimeoutExpired:
             output = "Error: Timeout (300s)"

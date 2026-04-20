@@ -16,6 +16,7 @@ from pathlib import Path
 from prompt_toolkit.formatted_text import FormattedText, StyleAndTextTuples
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape as _rich_escape
 from rich.panel import Panel
 from rich.theme import Theme
 
@@ -61,6 +62,27 @@ def _fmt_tokens(n: int) -> str:
 def token_snapshot() -> tuple[int, int]:
     """현재까지 누적된 (in, out) 토큰 수 — subagent 턴별 delta 계산용."""
     return _tokens_in, _tokens_out
+
+
+# ── Assistant 응답 스트리밍 (라이브 리전) ─────────────────────────────────────
+# 토큰을 scrollback 에 raw 로 뿌리면 markdown 포맷이 깨지므로, prompt_toolkit 의
+# 라이브 영역 (_DisplayManager 의 render_ft) 에 ephemeral 하게 표시한다.
+# 턴이 끝나면 라이브 영역을 비우고 REPL 이 `print_assistant(reply)` 로
+# markdown 렌더된 최종본을 scrollback 에 커밋한다.
+
+def stream_assistant_begin() -> None:
+    """새 assistant 메시지 블록 시작 — 라이브 영역 스트림 버퍼 리셋."""
+    _display.stream_begin()
+
+
+def stream_assistant_delta(text: str) -> None:
+    """모델이 뱉은 토큰 조각을 라이브 영역 버퍼에 누적. scrollback 에는 찍지 않음."""
+    _display.stream_append(text)
+
+
+def stream_assistant_end() -> None:
+    """턴 끝 — 라이브 영역 비움. 최종 포맷된 출력은 print_assistant 가 담당."""
+    _display.stream_end()
 
 
 def fmt_time(seconds: float) -> str:
@@ -134,10 +156,69 @@ class _DisplayManager:
         self._spinner_text: str          = ""
         self._spinner_base: tuple        = _SHIMMER_BASE
         self._spinner_peak: tuple        = _SHIMMER_PEAK
+        # 라이브 영역 스트리밍 — 토큰 누적은 그대로 하되 live region 에는 그리지 않는다.
+        # (과거 spinner 라벨 shimmer 와 충돌해 'Thinking…' 이 깨지는 이슈 발견 → 제거)
+        # 모델 레이어 `on_content_delta` 는 유지해서 나중에 별도 영역/패턴으로 활용 가능.
+        self._stream_text:  str          = ""
+        # 현재 진행 중인 활동 — spinner 바로 아래 `↳ <활동>` 한 줄로 표시.
+        # loop.py 가 tool 호출 직전 set, 결과 확보 후 clear.
+        self._activity:     str          = ""
+        # Pending permission 요청 — `{summary, preview, showing_full}` dict 또는 None.
+        # agent/permission.py::PermissionManager 가 request 시 push, 결정 후 clear.
+        self._pending_perm: dict | None  = None
 
     @property
     def is_active(self) -> bool:
-        return self._in_spinner or bool(self._active_tasks) or bool(self._todos)
+        # stream_text 는 더 이상 live 표시 안 하므로 is_active 판정에서 제외.
+        return (
+            self._in_spinner
+            or bool(self._active_tasks)
+            or bool(self._todos)
+            or bool(self._activity)
+            or self._pending_perm is not None
+        )
+
+    # ── streaming (assistant content, accumulated but NOT rendered) ─────────
+    # 콜백이 호출돼도 live region 에는 그리지 않음. 최종 답은 REPL 이
+    # `print_assistant(reply)` 로 markdown 렌더해서 scrollback 에 커밋한다.
+
+    def stream_begin(self) -> None:
+        with self._lock:
+            self._stream_text = ""
+
+    def stream_append(self, text: str) -> None:
+        if not text:
+            return
+        with self._lock:
+            self._stream_text += text
+
+    def stream_end(self) -> None:
+        with self._lock:
+            self._stream_text = ""
+
+    # ── current activity indicator ──────────────────────────────────────────
+
+    def set_activity(self, text: str) -> None:
+        """Spinner 바로 아래 `↳ <text>` 로 표시할 현재 진행 라인 설정."""
+        with self._lock:
+            self._activity = text or ""
+
+    def clear_activity(self) -> None:
+        with self._lock:
+            self._activity = ""
+
+    # ── pending permission request ──────────────────────────────────────────
+
+    def set_pending_permission(self, info: dict) -> None:
+        """PermissionManager 가 승인 대기 상태 진입 시 호출.
+        info = {'summary': str, 'preview': str, 'showing_full': bool}
+        """
+        with self._lock:
+            self._pending_perm = info
+
+    def clear_pending_permission(self) -> None:
+        with self._lock:
+            self._pending_perm = None
 
     # ── spinner interface ────────────────────────────────────────────────────
 
@@ -229,6 +310,33 @@ class _DisplayManager:
         parts: StyleAndTextTuples = []
         now = time.time()
 
+        # 0) Pending permission 이 있으면 최상단에 크게 — 사용자 결정이 block.
+        #    spinner/activity 는 중복 시각 노이즈라 이 모드에선 생략.
+        if self._pending_perm is not None:
+            info = self._pending_perm
+            parts.append(("bold #FFD75F", " ⚠  "))
+            parts.append(("bold #E4E4E4", info.get("summary") or ""))
+            parts.append(("", "\n"))
+            parts.append(("#6C6C6C", "    ─────────────  preview" +
+                          ("  (full)" if info.get("showing_full") else "  (앞 15줄)") +
+                          "  ─────────────"))
+            for ln in (info.get("preview") or "").splitlines() or [""]:
+                parts.append(("", "\n"))
+                parts.append(("#E4E4E4", f"    {ln}"))
+            parts.append(("", "\n"))
+            parts.append(("#6C6C6C", "    " + "─" * 57))
+            parts.append(("", "\n"))
+            parts.append(("bold #5FD7AF", "    [y]"))
+            parts.append(("#E4E4E4", " 승인   "))
+            parts.append(("bold #FF8787", "[n]"))
+            parts.append(("#E4E4E4", " 거부   "))
+            parts.append(("bold #87AFFF", "[d]"))
+            parts.append(("#E4E4E4", " 전체 diff   "))
+            parts.append(("bold #FFAF5F", "[a]"))
+            parts.append(("#E4E4E4", " 이 세션 내내 자동승인   "))
+            parts.append(("#6C6C6C", "(3분 타임아웃)"))
+            return FormattedText(parts)
+
         # 1) Todo 섹션 (가장 위)
         if self._todos:
             done  = sum(1 for it in self._todos if it.get("status") == "completed")
@@ -280,6 +388,11 @@ class _DisplayManager:
                 sub.append(f"↑{_fmt_tokens(_tokens_in)} ↓{_fmt_tokens(_tokens_out)}")
             parts.append(("#6C6C6C", f"  ({' · '.join(sub)})"))
 
+            # 2b) 현재 활동 서브라인 — `↳ <tool> <arg>` 형태로 spinner 바로 아래
+            if self._activity:
+                parts.append(("", "\n"))
+                parts.append(("#6C6C6C", f"    ↳ {self._activity}"))
+
         # 3) 활성 subagent — pulsing bullet + 현재 action
         for task in self._active_tasks:
             if parts:
@@ -320,6 +433,24 @@ def display_clear_todos() -> None:
     _display.clear_todos()
 
 
+def set_activity(text: str) -> None:
+    """spinner 바로 아래 `↳ <text>` 서브라인 설정. 현재 실행 중 tool/단계 표시용."""
+    _display.set_activity(text)
+
+
+def clear_activity() -> None:
+    _display.clear_activity()
+
+
+def set_pending_permission(info: dict) -> None:
+    """permission.py::PermissionManager 가 승인 요청 시 호출 — live region 에 표시."""
+    _display.set_pending_permission(info)
+
+
+def clear_pending_permission() -> None:
+    _display.clear_pending_permission()
+
+
 # ── TaskBoard proxy (외부 API 호환 유지) ──────────────────────────────────────
 
 class _TaskBoardProxy:
@@ -353,15 +484,61 @@ def print_user_prompt(label: str = ">> ") -> str:
     return console.input(f"[bold cyan]{label}[/bold cyan] ")
 
 
-def print_tool_call(name: str, output: str, max_preview: int = 200) -> None:
-    # 1) scrollback — subagent 내부면 한 단계 더 들여쓰기
-    preview = output[:max_preview] + ("…" if len(output) > max_preview else "")
-    indent = "      " if _display._active_tasks else "  "
-    console.print(
-        f"{indent}[tool.name]⎿ {name}[/tool.name]  [tool.output]{preview}[/tool.output]"
-    )
-    # 2) 활성 subagent 가 있으면 그 bullet 의 action 을 live 업데이트
-    _display.update_tool(name, output)
+def print_tool_call(
+    name: str,
+    output: str,
+    max_preview: int = 200,
+    max_lines: int = 10,
+) -> None:
+    """Commit one tool-call bullet to scrollback, **preserving** multi-line
+    structure and leading indentation of the output.
+
+    Layout:
+        ``  ⎿ <name>  <line 1>``
+        ``            <line 2>``     ← continuation lines align under line 1
+        ``            … (+N more lines)``
+
+    - `max_preview` : per-line character cap (mid-line … if exceeded)
+    - `max_lines`   : total lines shown; more → tail summarized as `+N more`
+
+    전체 output 은 `state.messages` 에 그대로 보존되므로 프리뷰는 시각적 요약용.
+    Subagent 내부에서 호출되면 해당 task 의 pulsing-bullet action 필드만 갱신.
+    """
+    if _display._active_tasks:
+        _display.update_tool(name, output)
+        return
+
+    text = (output or "").rstrip()
+    if not text:
+        console.print(
+            f"  [tool.name]⎿ {name}[/tool.name]  [tool.output](no output)[/tool.output]"
+        )
+        return
+
+    raw_lines = text.splitlines() or [text]
+    # per-line length cap
+    lines = [
+        ln if len(ln) <= max_preview else ln[:max_preview] + "…"
+        for ln in raw_lines
+    ]
+    total = len(lines)
+    truncated = total > max_lines
+    if truncated:
+        lines = lines[:max_lines]
+
+    # continuation column = 2 (leading) + 2 ("⎿ ") + len(name) + 2 ("  ")
+    cont = " " * (6 + len(name))
+
+    parts = [
+        f"  [tool.name]⎿ {name}[/tool.name]  "
+        f"[tool.output]{_rich_escape(lines[0])}[/tool.output]"
+    ]
+    for ln in lines[1:]:
+        parts.append(f"{cont}[tool.output]{_rich_escape(ln)}[/tool.output]")
+    if truncated:
+        parts.append(f"{cont}[dim]… (+{total - max_lines} more lines)[/dim]")
+
+    console.print("\n".join(parts))
 
 
 def print_subagent_start(description: str) -> None:

@@ -230,7 +230,7 @@ multi-agent/
 
 모델이 intent 에 맞게 `load_skill(name)` 를 호출하면 해당 스킬의 step-by-step playbook 이 context 에 주입됨. 카탈로그(이름 + description)는 system prompt 에 항상 실려있어 트리거 기반 discovery 가능.
 
-### 포함된 스킬 (`skills/`)
+### 포함된 스킬 (`skills/skill.md`)
 
 | 스킬 | 트리거 | 내용 |
 |------|--------|------|
@@ -371,42 +371,41 @@ uv run python eval.py --verbose    # 응답 본문 + tool 호출 trace
 
 현재 시나리오 (`SCENARIOS` in `eval.py`):
 
-| 이름 | 초점 |
-|------|------|
-| `read_readme`            | 기본 `read_file` — 서브에이전트/팀 툴로 튀지 않는지 |
-| `grep_for_class`         | 심볼 검색은 `grep` — `bash grep` 금지 |
-| `write_file_scratch`     | `write_file` 로 파일 생성 (parent dir 자동 생성) |
-| `todo_multistep`         | 멀티스텝 작업에 `todo` 사용 + 각 파일 `read_file` |
-| `no_bash_for_search`     | "몇 번 나와?" 질문도 `grep` (+`output_mode='count'`) |
-| `korean_query_expansion` | 한국어 개념("상태표시줄") → 영문 식별자 확장 후 `grep` |
+---
 
-종료 코드 = 실패한 시나리오 수. CI 에 물려도 되고, 모델/프롬프트 바꿨을 때 regression 감지용으로도 사용.
+## 프로젝트 구조 설명
 
-시나리오 추가: `SCENARIOS` 리스트에 `Scenario(name, prompt, must_call, must_not_call, grader)` 추가만 하면 됨.
+다음은 이 프로젝트의 디렉토리와 파일 구조에 대한 간략한 설명입니다:
 
-### 결과 저장 위치
-
-매 실행마다 `.eval_runs/<YYYY-MM-DDTHH-MM-SS>/` 디렉토리가 생기고 아래 파일들이 저장됨:
-
-| 파일 | 내용 |
-|------|------|
-| `summary.json`                 | 전체 pass/fail + 시나리오별 `{ok, reason, elapsed, calls}` |
-| `<scenario>.reply.txt`         | 해당 시나리오의 최종 assistant 응답 (사람이 읽기 좋게 텍스트) |
-| `<scenario>.history.jsonl`     | 전체 turn (user / assistant / tool_calls / tool results) — 디버깅 용 |
-| `<scenario>.error.txt`         | 예외 발생 시 traceback (정상 실행 시 없음) |
-
-실행이 끝나면 콘솔 마지막에 `→ results saved to .eval_runs/…/` 로 경로를 찍어줌. 실패 원인 파보려면 `cat .eval_runs/<ts>/<scenario>.history.jsonl | jq .` 로 tool 호출 시퀀스 확인.
-
-주의
-- 매 시나리오마다 fresh agent → 실제 LLM 호출 비용/시간 발생 (전체 ~1–3분, 소수의 달러).
-- `write_file_scratch` 는 `.eval_scratch/` 디렉토리를 만들었다가 끝나면 삭제.
-- `.eval_scratch/` 와 `.eval_runs/` 는 모두 `.gitignore` 에 등록됨.
+- **main.py**: 프로젝트의 단일 진입점으로, 사용자 요청을 처리하는 역할을 합니다.
+- **agent/**: 에이전트 관련 코드가 포함된 디렉토리로, 다양한 기능을 수행하는 모듈들이 포함되어 있습니다.
+- **model/**: 다양한 모델 관련 설정 및 모델 클래스를 포함하고 있으며, `OpenAIModel`과 `VLLMModel`이 주요 클래스입니다.
+- **skills/**: 여러 기능적 스킬들이 정의된 디렉토리로, 각 스킬은 특정 작업을 수행하도록 설계되어 있습니다.
+- **tools/**: 다양한 도구 및 핸들러 관련 코드가 포함되어 있으며, 외부 서비스와의 통합을 지원합니다.
+- **utils/**: 보조 기능을 제공하는 유틸리티 코드가 포함되어 있습니다.
 
 ---
 
-## 참고
+## 기여 방법
 
-- 탐색/이슈조사/팀 모드가 모두 `UNIFIED_TOOLS` 에 묶여 있어 모델이 intent 만 맞으면 자동 선택.
-- system prompt 에 **completeness check / query expansion / 조기포기 금지** 지시가 명시돼 있어, tool 출력 잘렸거나 `(no matches)` 나와도 모델이 재시도하도록 유도.
-- `compact_history` 는 요약 전 `.transcripts/<timestamp>.jsonl` 로 전체 대화 저장.
-- `normalize_messages` 는 고아 `tool_call` 에 placeholder 를 삽입해 로컬 모델의 history 검증 실패를 예방.
+이 프로젝트에 기여하고자 하는 개발자를 위한 가이드를 아래와 같이 제공합니다:
+
+1. **코드 스타일**: 프로젝트의 코드 스타일을 준수해 주세요. 일반적으로 PEP 8 스타일 가이드라인을 따릅니다.
+2. **브랜치 전략**: 기능 추가나 버그 수정을 위해 새로운 브랜치를 생성하고 작업하세요. `main` 브랜치에 직접 커밋하지 마세요.
+3. **Pull Request 가이드라인**: PR을 제출하기 전에 모든 테스트를 통과했는지 확인하고, 코드 리뷰를 요청하세요. PR 설명에는 변경 사항에 대한 충분한 설명을 제공해 주세요.
+
+---
+
+## 문제 해결
+
+자주 발생할 수 있는 문제와 그에 대한 해결책을 아래와 같이 안내합니다:
+
+- **의존성 설치 오류**: `uv sync` 명령어로 의존성을 설치할 때 오류가 발생한다면, Python 버전이 호환되는지 확인하고, 필요 시 가상 환경을 다시 생성하세요.
+- **환경 설정 관련 문제**: `.env` 파일이 올바르게 설정되어 있는지 확인하세요. 특히 API 키나 모델 URL 설정이 정확한지 점검하세요.
+
+---
+
+## 관련 문서 링크
+
+- [CLAUDE.md](./CLAUDE.md): 프로젝트의 상세한 기술적 배경과 설계를 설명합니다.
+- [SKILL.md](./skills/skill.md): 각 스킬의 상세 내용을 포함하고 있습니다.

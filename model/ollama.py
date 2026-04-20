@@ -1,8 +1,11 @@
 """Main orchestrator LLM: local ollama server via OpenAI-compatible API."""
 
+from collections.abc import Callable
+
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
 
+from ._stream import accumulate_stream
 from .base import BaseLLM
 from .config import ModelConfig, ollama_config
 
@@ -19,6 +22,7 @@ class OllamaModel(BaseLLM):
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
+        on_content_delta: Callable[[str], None] | None = None,
         **kwargs,
     ) -> ChatCompletion:
         params: dict = {
@@ -30,4 +34,11 @@ class OllamaModel(BaseLLM):
         }
         if tools:
             params["tools"] = tools
-        return self._client.chat.completions.create(**params)
+
+        if on_content_delta is None:
+            return self._client.chat.completions.create(**params)
+
+        params["stream"] = True
+        params["stream_options"] = {"include_usage": True}
+        stream = self._client.chat.completions.create(**params)
+        return accumulate_stream(stream, on_delta=on_content_delta)

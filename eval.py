@@ -110,7 +110,7 @@ def file_has(path: Path, needle: str) -> Callable[[str, list[dict]], tuple[bool,
         del reply, history
         if not path.exists():
             return False, f"{path} not created"
-        if needle not in path.read_text():
+        if needle not in path.read_text(encoding="utf-8"):
             return False, f"{path} missing {needle!r}"
         return True, ""
     return g
@@ -171,6 +171,8 @@ def _build() -> OrchestratorAgent:
         main_model=OpenAIModel(),
         sub_model=VLLMModel(),
         skills_dir=Path("skills"),
+        # eval 은 비대화형 — 파괴적 tool 승인 프롬프트 없이 즉시 통과.
+        auto_approve_all=True,
     )
 
 
@@ -208,13 +210,14 @@ def _persist_scenario(
     error: Exception | None = None,
 ) -> None:
     """Save per-scenario artefacts: reply text + full history JSONL (+ error if any)."""
-    (run_dir / f"{s.name}.reply.txt").write_text(reply or "")
-    with (run_dir / f"{s.name}.history.jsonl").open("w") as f:
+    (run_dir / f"{s.name}.reply.txt").write_text(reply or "", encoding="utf-8")
+    with (run_dir / f"{s.name}.history.jsonl").open("w", encoding="utf-8") as f:
         for msg in history:
             f.write(json.dumps(msg, default=str, ensure_ascii=False) + "\n")
     if error is not None:
         (run_dir / f"{s.name}.error.txt").write_text(
-            f"{type(error).__name__}: {error}\n\n{traceback.format_exc()}"
+            f"{type(error).__name__}: {error}\n\n{traceback.format_exc()}",
+            encoding="utf-8",
         )
 
 
@@ -262,7 +265,8 @@ def main() -> int:
         "results": [asdict(r) for r in results],
     }
     (run_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False)
+        json.dumps(summary, indent=2, ensure_ascii=False),
+        encoding="utf-8",
     )
 
     print(f"\n{passed}/{total} passed")

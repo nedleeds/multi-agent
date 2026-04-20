@@ -15,6 +15,8 @@
           → 모든 결과 종합 → 구조화된 분석 리포트
 """
 
+import threading
+
 from model.base import BaseLLM
 from tools import definitions
 from tools.api import BitbucketClient, ConfluenceClient, JiraClient
@@ -85,6 +87,7 @@ class IssueInvestigatorAgent:
         self.planner = TodoManager()
         self.compact_state = CompactState()
         self.history: list[dict] = []
+        self.cancel_event = threading.Event()
 
         self._extra_handlers = {
             "todo":            self._handle_todo,
@@ -93,6 +96,9 @@ class IssueInvestigatorAgent:
             "confluence_task": self._handle_confluence_task,
             "compact":         self._handle_compact,
         }
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
 
     # ── Registry ───────────────────────────────────────────────────────────
 
@@ -129,6 +135,7 @@ class IssueInvestigatorAgent:
             system=_JIRA_SUBAGENT_SYSTEM,
             description="jira",
             tools=definitions.JIRA_TOOLS,
+            cancel_event=self.cancel_event,
         )
 
     def _handle_bitbucket_task(self, prompt: str) -> str:
@@ -140,6 +147,7 @@ class IssueInvestigatorAgent:
             system=_BITBUCKET_SUBAGENT_SYSTEM,
             description="bitbucket",
             tools=definitions.BITBUCKET_TOOLS,
+            cancel_event=self.cancel_event,
         )
 
     def _handle_confluence_task(self, prompt: str) -> str:
@@ -151,6 +159,7 @@ class IssueInvestigatorAgent:
             system=_CONFLUENCE_SUBAGENT_SYSTEM,
             description="confluence",
             tools=definitions.CONFLUENCE_TOOLS,
+            cancel_event=self.cancel_event,
         )
 
     def _handle_compact(self, focus: str | None = None) -> str:
@@ -165,6 +174,7 @@ class IssueInvestigatorAgent:
 
     def run(self, issue_description: str) -> str:
         """이슈 현상을 입력받아 조사 결과 리포트를 반환합니다."""
+        self.cancel_event.clear()
         self.history.append({"role": "user", "content": issue_description})
 
         self.history[:] = micro_compact(self.history)
@@ -174,7 +184,7 @@ class IssueInvestigatorAgent:
                 self.history, self.compact_state, self.main_model
             )
 
-        state = LoopState(messages=self.history)
+        state = LoopState(messages=self.history, cancel_event=self.cancel_event)
         agent_loop(
             state=state,
             model=self.main_model,

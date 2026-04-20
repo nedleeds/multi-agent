@@ -1,7 +1,17 @@
-"""Model connection settings, loaded from environment variables."""
+"""Model connection settings, loaded from environment variables.
+
+플랫폼별 기본값:
+  - macOS / Linux: 공식 OpenAI API (`api.openai.com`)
+  - Windows: 사내 LLM 서버 (`api.hd-aic.com`)
+
+`.env` 의 `OPENAI_BASE_URL` / `OPENAI_MODEL` / `OPENAI_API_KEY` 는 플랫폼 기본값을
+항상 override 한다.
+"""
 
 import os
 from dataclasses import dataclass
+
+from utils.shell import IS_WINDOWS
 
 
 @dataclass
@@ -32,12 +42,21 @@ def vllm_config() -> ModelConfig:
 
 
 def openai_config() -> ModelConfig:
-    # base_url 은 OpenAI API 기본값을 쓰되, 회사 로컬 gpt-oss 서버처럼
-    # OpenAI-compatible 엔드포인트를 쓸 때는 env 로 override.
+    # Windows = 사내 서버, macOS/Linux = 공식 OpenAI API.
+    # `.env` 값은 플랫폼 기본값을 항상 override.
+    if IS_WINDOWS:
+        default_base_url = "https://api.hd-aic.com/hd-llm-model/v1"
+        default_model_id = "/models/gpt-oss-120b"
+        default_api_key = os.getenv("AIC_API_KEY", "token-abc123")
+    else:
+        default_base_url = "https://api.openai.com/v1"
+        default_model_id = "gpt-oss-120b"
+        default_api_key = "dummy"
+
     return ModelConfig(
-        base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        model_id=os.getenv("OPENAI_MODEL", "gpt-oss-120b"),
-        api_key=os.getenv("OPENAI_API_KEY", "dummy"),
+        base_url=os.getenv("OPENAI_BASE_URL", default_base_url),
+        model_id=os.getenv("OPENAI_MODEL", default_model_id),
+        api_key=os.getenv("OPENAI_API_KEY", default_api_key),
         max_tokens=int(os.getenv("OPENAI_MAX_TOKENS", "16000")),
         temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.7")),
     )

@@ -48,28 +48,26 @@ class ConfluenceConfig:
 
 def jira_config() -> JiraConfig:
     return JiraConfig(
-        base_url=os.getenv("JIRA_BASE_URL", ""),
-        email=os.getenv("JIRA_EMAIL", ""),
-        api_token=os.getenv("JIRA_API_TOKEN", ""),
-        project_key=os.getenv("JIRA_PROJECT_KEY", ""),
+        base_url=os.getenv("JIRA_URL", os.getenv("JIRA_BASE_URL", "")),
+        email=os.getenv("JIRA_USERNAME", os.getenv("JIRA_EMAIL", "")),
+        api_token=os.getenv("JIRA_PASSWORD", os.getenv("JIRA_API_TOKEN", "")),
+        project_key=os.getenv("JIRA_DEFAULT_PROJECT", os.getenv("JIRA_PROJECT_KEY", "")),
     )
-
 
 def bitbucket_config() -> BitbucketConfig:
     return BitbucketConfig(
-        base_url=os.getenv("BITBUCKET_BASE_URL", ""),
+        base_url=os.getenv("BITBUCKET_URL", os.getenv("BITBUCKET_BASE_URL", "")),
         username=os.getenv("BITBUCKET_USERNAME", ""),
-        app_password=os.getenv("BITBUCKET_APP_PASSWORD", ""),
-        project_key=os.getenv("BITBUCKET_PROJECT_KEY", ""),
+        app_password=os.getenv("BITBUCKET_TOKEN", os.getenv("BITBUCKET_APP_PASSWORD", "")),
+        project_key=os.getenv("BITBUCKET_DEFAULT_PROJECT", os.getenv("BITBUCKET_PROJECT_KEY", "")),
         repo_slug=os.getenv("BITBUCKET_REPO_SLUG", ""),
         server_type=os.getenv("BITBUCKET_TYPE", "server"),  # "server" | "cloud"
     )
 
-
 def confluence_config() -> ConfluenceConfig:
     return ConfluenceConfig(
-        base_url=os.getenv("CONFLUENCE_BASE_URL", ""),
-        email=os.getenv("CONFLUENCE_EMAIL", ""),
-        api_token=os.getenv("CONFLUENCE_API_TOKEN", ""),
+        base_url=os.getenv("CONFLUENCE_URL", os.getenv("CONFLUENCE_BASE_URL", "")),
+        email=os.getenv("CONFLUENCE_USERNAME", os.getenv("CONFLUENCE_EMAIL", "")),
+        api_token=os.getenv("CONFLUENCE_PASSWORD", os.getenv("CONFLUENCE_API_TOKEN", "")),
         space_key=os.getenv("CONFLUENCE_SPACE_KEY", ""),
     )

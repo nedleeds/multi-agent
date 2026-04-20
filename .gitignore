@@ -26,6 +26,7 @@ dist/
 
 # REPL / runtime state
 .agent_history
+.agent_logs/
 .tasks/
 .transcripts/
 .worktrees/
