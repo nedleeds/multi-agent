@@ -32,12 +32,10 @@ def vllm_config() -> ModelConfig:
 
 
 def openai_config() -> ModelConfig:
-    # base_url 은 OpenAI API 기본값을 쓰되, 회사 로컬 gpt-oss 서버처럼
-    # OpenAI-compatible 엔드포인트를 쓸 때는 env 로 override.
     return ModelConfig(
-        base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        model_id=os.getenv("OPENAI_MODEL", "gpt-oss-120b"),
-        api_key=os.getenv("OPENAI_API_KEY", "dummy"),
+        base_url=os.getenv("OPENAI_BASE_URL", "https://api.hd-aic.com/hd-llm-model/v1"),
+        model_id=os.getenv("OPENAI_MODEL", "/models/gpt-oss-120b"),
+        api_key=os.getenv("OPENAI_API_KEY", os.getenv("AIC_API_KEY", "token-abc123")),
         max_tokens=int(os.getenv("OPENAI_MAX_TOKENS", "16000")),
         temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.7")),
     )

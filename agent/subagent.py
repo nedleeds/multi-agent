@@ -7,12 +7,12 @@ a text summary PLUS a compact evidence trail of its tool calls to the parent.
     Parent (ollama/120b)               Subagent (vllm/gemma4)
     ┌──────────────────┐               ┌──────────────────┐
     │ history=[...]    │  task(prompt) │ messages=[]  ◄── fresh
-    │                  │ ───────────► │                  │
-    │                  │              │ while tool_calls: │
-    │                  │              │   execute tools  │
-    │                  │  summary     │                  │
-    │                  │  + evidence  │                  │
-    │ result = "..."   │ ◄─────────── │ return report    │
+    │                  │  ───────────► │                  │
+    │                  │               │ while tool_calls:│
+    │                  │               │   execute tools  │
+    │                  │   summary     │                  │
+    │                  │   + evidence  │                  │
+    │ result = "..."   │  ◄─────────── │ return report    │
     └──────────────────┘               └──────────────────┘
 """
 

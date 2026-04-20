@@ -32,7 +32,7 @@ class SkillRegistry:
 
     def _load_all(self, skills_dir: Path) -> None:
         for path in sorted(skills_dir.rglob("SKILL.md")):
-            meta, body = self._parse_frontmatter(path.read_text())
+            meta, body = self._parse_frontmatter(path.read_text(encoding="utf-8"))
             name = meta.get("name", path.parent.name)
             self._skills[name] = _SkillDoc(
                 name=name,

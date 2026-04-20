@@ -46,7 +46,7 @@ class JiraClient:
 
         try:
             resp = requests.get(
-                self._url("/rest/api/3/search"),
+                self._url("/rest/api/2/search"),
                 params={"jql": jql, "maxResults": max_results, "fields": fields},
                 auth=self._auth(),
                 headers=self._headers(),
@@ -95,7 +95,7 @@ class JiraClient:
             jql = self._build_jql(q)
             try:
                 resp = requests.get(
-                    self._url("/rest/api/3/search"),
+                    self._url("/rest/api/2/search"),
                     params={"jql": jql, "maxResults": max_per_query, "fields": fields},
                     auth=self._auth(),
                     headers=self._headers(),
@@ -168,7 +168,7 @@ class JiraClient:
         )
         try:
             resp = requests.get(
-                self._url(f"/rest/api/3/issue/{issue_key}"),
+                self._url(f"/rest/api/2/issue/{issue_key}"),
                 params={"fields": fields},
                 auth=self._auth(),
                 headers=self._headers(),
