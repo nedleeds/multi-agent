@@ -106,6 +106,8 @@ class REPLSession:
         self._agent_running: bool                   = False
         # 파괴적 tool 승인 브릿지 — run() 시 전달받음. 없으면 승인 게이트 disabled.
         self._permissions = None
+        # Ctrl+C double-tap 추적 — 첫 번째는 cancel 요청, 2초 내 두 번째는 강제 종료.
+        self._last_ctrl_c: float = 0.0
 
         self._buf = Buffer(
             name="input",
@@ -219,10 +221,31 @@ class REPLSession:
 
         @kb.add("c-c")
         def _(event):
-            if not event.current_buffer.text:
-                event.app.exit()
-            else:
+            import time as _t
+            # 1) 입력 버퍼에 글자가 있으면 버퍼만 지움 (agent 돌든 말든)
+            if event.current_buffer.text:
                 event.current_buffer.reset()
+                self._last_ctrl_c = 0.0
+                return
+
+            now = _t.monotonic()
+            # 2) Agent 실행 중 — cancel 요청. 2초 내 재차 누르면 강제 종료.
+            if self._agent_running:
+                if now - self._last_ctrl_c < 2.0:
+                    # double-tap — /killall 동등, 즉시 프로세스 죽임
+                    sys.stderr.write("\n⏻  Ctrl+C ×2 — terminating immediately\n")
+                    sys.stderr.flush()
+                    os._exit(130)
+                self._last_ctrl_c = now
+                if self._on_cancel:
+                    self._on_cancel()
+                run_in_terminal(lambda: console.print(
+                    "[info] ⏹  Ctrl+C — cancel at next turn boundary. Press again within 2s to force kill.[/info]"
+                ))
+                return
+
+            # 3) Agent 유휴 + 버퍼 비어있음 — 기존 동작 (앱 종료)
+            event.app.exit()
 
         @kb.add("c-d")
         def _(event):
@@ -327,6 +350,7 @@ class REPLSession:
 
     async def _run_agent_async(self, line: str) -> None:
         self._agent_running = True
+        self._last_ctrl_c = 0.0  # 새 턴 시작 — 이전 Ctrl+C 흔적 리셋
         refresh = asyncio.create_task(self._refresh_loop())
         try:
             loop = asyncio.get_running_loop()
@@ -340,6 +364,7 @@ class REPLSession:
             except asyncio.CancelledError:
                 pass
             self._agent_running = False
+            self._last_ctrl_c = 0.0  # 턴 종료 — 다음 턴의 Ctrl+C 는 신선한 첫 탭
             self._app.invalidate()
 
     async def _refresh_loop(self) -> None:
