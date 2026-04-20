@@ -8,8 +8,10 @@ Thinking shimmer 와 subagent bullet pulse 는 REPL 레이아웃에 추가된 Wi
 
 import math
 import re
+import shutil
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -19,6 +21,45 @@ from rich.markdown import Markdown
 from rich.markup import escape as _rich_escape
 from rich.panel import Panel
 from rich.theme import Theme
+
+
+# ── 라이브 리전 라인 wrap 방지 ────────────────────────────────────────────────
+# 터미널 너비보다 긴 라인은 wrap 돼서 _spinner_height 계산이 어긋난다 → 입력 영역
+# 과 겹치는 렌더 깨짐. render_ft 가 방출하는 모든 가변 라벨은 `_fit_width` 로
+# 터미널 폭에 맞춰 잘라서 넘겨 wrap 자체를 일어나지 않게 한다.
+def _char_cols(ch: str) -> int:
+    """CJK/fullwidth = 2cols, 그 외 = 1col. 한글·일본어 정확히 잡음."""
+    return 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
+
+
+def _visual_width(text: str) -> int:
+    return sum(_char_cols(c) for c in text)
+
+
+def _fit_width(text: str, max_cols: int) -> str:
+    """visual width 기준으로 `text` 를 `max_cols` 이하로 잘라 `…` 덧붙임."""
+    if max_cols <= 1:
+        return "…"
+    if _visual_width(text) <= max_cols:
+        return text
+    out: list[str] = []
+    cols = 0
+    for ch in text:
+        w = _char_cols(ch)
+        if cols + w > max_cols - 1:
+            out.append("…")
+            break
+        out.append(ch)
+        cols += w
+    return "".join(out)
+
+
+def _term_cols() -> int:
+    """현재 터미널 width (column 수). 얻을 수 없으면 80 fallback."""
+    try:
+        return max(40, shutil.get_terminal_size((80, 24)).columns)
+    except Exception:
+        return 80
 
 _theme = Theme({
     "tool.name":   "bold yellow",
@@ -341,13 +382,16 @@ class _DisplayManager:
         if self._todos:
             done  = sum(1 for it in self._todos if it.get("status") == "completed")
             total = len(self._todos)
+            # 각 todo 라인은 `    [icon]  [label]` — 6 col 프리픽스 뒤 라벨.
+            # 터미널 너비 초과 방지: 라벨을 width - 7 로 cap (wrap 금지).
+            label_max = max(10, _term_cols() - 7)
             parts.append(("bold #CC785C", " ✻  "))
             parts.append(("bold", "Todo"))
             parts.append(("#6C6C6C", f"  ({done}/{total})"))
             for item in self._todos:
                 status  = (item.get("status") or "pending").lower()
-                content = item.get("content") or ""
-                active  = (item.get("active_form") or "").strip()
+                content = _fit_width(item.get("content") or "", label_max)
+                active  = _fit_width((item.get("active_form") or "").strip(), label_max)
                 parts.append(("", "\n"))
                 if status == "completed":
                     parts.append(("#5FD787", "    ☑  "))
@@ -374,24 +418,28 @@ class _DisplayManager:
             char, color = _SPINNER_FRAMES[idx]
             parts.append((color, f" {char}  "))
 
-            label = self._spinner_text
+            # 스피너 라벨 + elapsed/토큰 서브 한 줄에 맞추기 — 터미널 너비 초과 시 wrap 방지.
+            elapsed = now - _spin_start
+            sub_bits = [_fmt_time(elapsed)]
+            tk = _tokens_in + _tokens_out
+            if tk > 0:
+                sub_bits.append(f"↑{_fmt_tokens(_tokens_in)} ↓{_fmt_tokens(_tokens_out)}")
+            sub_str = f"  ({' · '.join(sub_bits)})"
+            # 프리픽스 ` X  ` (4col) + 라벨 + sub → 여유는 term - 4 - len(sub)
+            label_budget = max(10, _term_cols() - 4 - _visual_width(sub_str))
+            label = _fit_width(self._spinner_text, label_budget)
             cycle = 2.4
             pos = (now % cycle) / cycle * (len(label) + 8) - 4
             for i, ch in enumerate(label):
                 c = _shimmer_color(abs(i - pos), self._spinner_base, self._spinner_peak)
                 parts.append((c, ch))
+            parts.append(("#6C6C6C", sub_str))
 
-            elapsed = now - _spin_start
-            sub = [_fmt_time(elapsed)]
-            total = _tokens_in + _tokens_out
-            if total > 0:
-                sub.append(f"↑{_fmt_tokens(_tokens_in)} ↓{_fmt_tokens(_tokens_out)}")
-            parts.append(("#6C6C6C", f"  ({' · '.join(sub)})"))
-
-            # 2b) 현재 활동 서브라인 — `↳ <tool> <arg>` 형태로 spinner 바로 아래
+            # 2b) 현재 활동 서브라인 — `    ↳ <text>`; 4+2=6 col 프리픽스.
             if self._activity:
                 parts.append(("", "\n"))
-                parts.append(("#6C6C6C", f"    ↳ {self._activity}"))
+                act_budget = max(10, _term_cols() - 6)
+                parts.append(("#6C6C6C", f"    ↳ {_fit_width(self._activity, act_budget)}"))
 
         # 3) 활성 subagent — pulsing bullet + 현재 action
         for task in self._active_tasks:
@@ -400,13 +448,17 @@ class _DisplayManager:
             pulse = 0.5 + 0.5 * math.sin(now * 3.5)
             bullet_color = _lerp_color(pulse, _PULSE_BASE, _PULSE_PEAK)
             parts.append((f"bold {bullet_color}", "  ●  "))
-            parts.append(("bold", task.description))
+            # task description + `  (Ns)` — wrap 방지를 위해 라벨 cap.
             elapsed = now - task.start_time
-            parts.append(("#6C6C6C", f"  ({_fmt_time(elapsed)})"))
+            suffix = f"  ({_fmt_time(elapsed)})"
+            desc_budget = max(10, _term_cols() - 5 - _visual_width(suffix))
+            parts.append(("bold", _fit_width(task.description, desc_budget)))
+            parts.append(("#6C6C6C", suffix))
             # action 이 기본값이 아니면 다음 줄에 표시
             if task.action and task.action != "starting…":
                 parts.append(("", "\n"))
-                parts.append(("#6C6C6C", f"       ↳ {task.action}"))
+                action_budget = max(10, _term_cols() - 9)  # `       ↳ ` = 9col
+                parts.append(("#6C6C6C", f"       ↳ {_fit_width(task.action, action_budget)}"))
 
         return FormattedText(parts)
 
