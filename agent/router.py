@@ -42,6 +42,7 @@ Each step = one concrete, checkable outcome (not implementation minutiae).
 **Skip plan** (emit `(none)`) for:
   - CHAT, single grep/read, trivial one-liners
   - Ambiguous requests (let the agent probe first)
+  - EXCEPTION: ISSUE intent always gets a plan regardless of ambiguity
 
 **For behavioral questions** ("어떻게 동작?", "X 하면 Y는 어떻게 처리?"):
 plan should target the feature's **core implementation file** directly, NOT the
@@ -77,14 +78,23 @@ PLAN: (none)
 →
 INTENT: ISSUE
 PLAN:
-- Jira MEDIA-412 및 유사 티켓 조사
-- 관련 commit / PR diff 식별
-- 원인 가설 + 최소 수정안 제시
+- Jira에서 playback timeout 관련 티켓 검색 및 상세 조회
+- 연관 커밋/PR Bitbucket에서 확인
+- 결과 종합 및 원인 요약
+
+"현장에서 에러 발생, 관련 이슈 알려줘"
+→
+INTENT: ISSUE
+PLAN:
+- Jira에서 관련 티켓 검색 및 상세 조회
+- 해당 티켓에 연결된 Bitbucket 커밋/PR 확인
+- 필요시, Confluence에서 관련 문서 및 과거 인시던트 검토. 없으면 생략
+- 종합 의견 정리 및 보고 
 
 "task_manager 분석하고 TODO 기능 붙이는 설계 해"
 →
 INTENT: CODING
-PLAN:
+PLAN
 - task_manager 현재 API 파악 (grep/read 로 public 메서드 목록화)
 - TODO 통합 포인트 선정
 - 설계안 (인터페이스 + 변경 파일) 제안
@@ -192,6 +202,7 @@ def classify(
             tools=None,
             temperature=0.0,
             max_tokens=400,  # INTENT 한 줄 + 최대 ~5 step plan 여유있게
+            timeout = 5.0
         )
         latency_ms = int((time.monotonic() - started) * 1000)
         raw = (response.choices[0].message.content or "").strip()
@@ -215,6 +226,9 @@ def classify(
         )
     except Exception as exc:
         latency_ms = int((time.monotonic() - started) * 1000)
+        import traceback
+        print(f"[router ERROR] {type(exc).__name__}: {exc}")
+        traceback.print_exc()
         return RouterResult(
             intents={"CODING", "ISSUE", "TEAM"},
             plan=[],

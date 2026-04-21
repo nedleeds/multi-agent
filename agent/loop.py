@@ -120,8 +120,25 @@ def _bullet_summary(name: str, args: dict, output: str) -> str:
         return f"edited {args.get('path', '?')}"
     if name == "load_skill":
         return f"loaded: {args.get('name', '?')}"
-    # bash / task / jira_task / bitbucket_task / confluence_task / 기타 —
-    # 출력 자체가 사용자 관심사라 기존처럼 raw output.
+    if name in ("jira_task", "bitbucket_task", "confluence_task"):
+        summary_lines: list[str] = []
+        in_summary = False
+        for line in output.splitlines():
+            if line.strip().startswith("## Summary"):
+                in_summary = True
+                continue
+            if in_summary:
+                if line.strip().startswith("##"):
+                    break
+                if line.strip():
+                    summary_lines.append(line.strip())
+                if len(summary_lines) >= 2:
+                    break
+        if summary_lines:
+            # 줄바꿈 없이 한 줄로 합치기 → print_tool_call splitlines 우회
+            return " · ".join(summary_lines)[:200]
+        return output.splitlines()[0][:200] if output else ""
+
     return output
 
 
@@ -152,6 +169,13 @@ def run_one_turn(
         stream_assistant_begin()
         on_delta = stream_assistant_delta
     try:
+        api_messages = [
+            {**m, "content": m.get("content") or ""}
+            if m.get("role") == "assistant" and m.get("content") is None and not m.get("tool_calls")
+            else m
+            for m in api_messages
+        ]
+
         response = model.chat(api_messages, tools=tools or None, on_content_delta=on_delta)
         if stream_to_console:
             stream_assistant_end()
@@ -301,7 +325,8 @@ def run_one_turn(
                     state.recent_tool_sigs.append(sig)
                     if len(state.recent_tool_sigs) > 3:
                         state.recent_tool_sigs = state.recent_tool_sigs[-3:]
-                    print_tool_call(name, _bullet_summary(name, args, output))
+                    if name not in ("todo", "jira_task", "bitbucket_task", "confluence_task"):
+                        print_tool_call(name, _bullet_summary(name, args, output))
                     state.messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -332,7 +357,8 @@ def run_one_turn(
             state.todo_called = True
 
         # Tool 마다 맞춤 요약 (read_file/ls 등 결과 본문 대신 메타). LLM 은 full output 받음.
-        print_tool_call(name, _bullet_summary(name, args, output))
+        if name not in ("todo", "jira_task", "bitbucket_task", "confluence_task"):
+            print_tool_call(name, _bullet_summary(name, args, output))
         state.messages.append({
             "role": "tool",
             "tool_call_id": tc.id,
@@ -376,3 +402,6 @@ def agent_loop(
             if state.transition_reason == "cancelled":
                 console.print("[info]⏹  cancelled mid-turn[/info]")
             break
+
+
+

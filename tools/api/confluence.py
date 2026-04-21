@@ -28,7 +28,7 @@ class ConfluenceClient:
         self.config = config or confluence_config()
 
     def _auth(self) -> HTTPBasicAuth:
-        return HTTPBasicAuth(self.config.email, self.config.api_token)
+        return HTTPBasicAuth(self.config.username, self.config.api_token)
 
     def _headers(self) -> dict:
         return {"Accept": "application/json"}

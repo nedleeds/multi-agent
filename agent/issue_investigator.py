@@ -128,39 +128,86 @@ class IssueInvestigatorAgent:
 
     def _handle_jira_task(self, prompt: str) -> str:
         print_info("[jira_task] subagent 시작")
-        return run_subagent(
+        result = run_subagent(
             prompt=prompt,
             model=self.sub_model,
             registry=self.registry,
-            system=_JIRA_SUBAGENT_SYSTEM,
+            system=self._issue_subagent_prompt("jira"),
             description="jira",
             tools=definitions.JIRA_TOOLS,
             cancel_event=self.cancel_event,
         )
+        self._auto_advance_todo("jira_task")
+        return result
 
     def _handle_bitbucket_task(self, prompt: str) -> str:
         print_info("[bitbucket_task] subagent 시작")
-        return run_subagent(
+        result = run_subagent(
             prompt=prompt,
             model=self.sub_model,
             registry=self.registry,
-            system=_BITBUCKET_SUBAGENT_SYSTEM,
+            system=self._issue_subagent_prompt("bitbucket"),
             description="bitbucket",
             tools=definitions.BITBUCKET_TOOLS,
             cancel_event=self.cancel_event,
         )
+        self._auto_advance_todo("bitbucket_task")
+        return result
 
     def _handle_confluence_task(self, prompt: str) -> str:
         print_info("[confluence_task] subagent 시작")
-        return run_subagent(
+        result = run_subagent(
             prompt=prompt,
             model=self.sub_model,
             registry=self.registry,
-            system=_CONFLUENCE_SUBAGENT_SYSTEM,
+            system=self._issue_subagent_prompt("confluence"),
             description="confluence",
             tools=definitions.CONFLUENCE_TOOLS,
             cancel_event=self.cancel_event,
         )
+        self._auto_advance_todo("confluence_task")
+        return result
+
+def _auto_advance_todo(self, tool_name: str) -> None:
+    """delegation tool 완료 시 in_progress → completed, 다음 pending → in_progress."""
+    items = self.planner.state.items
+    if not items:
+        return
+
+    updated = []
+    for i, item in enumerate(items):
+        if item.status == "in_progress":
+            updated.append({
+                "content": item.content,
+                "status": "completed",
+                "active_form": item.active_form,
+            })
+            next_set = False
+            for j in range(i + 1, len(items)):
+                nxt = items[j]
+                if nxt.status == "pending" and not next_set:
+                    updated.append({
+                        "content": nxt.content,
+                        "status": "in_progress",
+                        "active_form": nxt.active_form,
+                    })
+                    next_set = True
+                else:
+                    updated.append({
+                        "content": nxt.content,
+                        "status": nxt.status,
+                        "active_form": nxt.active_form,
+                    })
+            break
+        else:
+            updated.append({
+                "content": item.content,
+                "status": item.status,
+                "active_form": item.active_form,
+            })
+
+    if updated:
+        self._handle_todo(updated)
 
     def _handle_compact(self, focus: str | None = None) -> str:
         if estimate_size(self.history) < CONTEXT_LIMIT // 2:

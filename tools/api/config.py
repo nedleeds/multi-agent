@@ -37,13 +37,13 @@ class BitbucketConfig:
 @dataclass
 class ConfluenceConfig:
     base_url: str       # e.g. https://your-domain.atlassian.net/wiki
-    email: str
+    username: str
     api_token: str
     space_key: str      # e.g. ENG (빈 문자열이면 전체 스페이스 검색)
 
     @property
     def configured(self) -> bool:
-        return bool(self.base_url and self.email and self.api_token)
+        return bool(self.base_url and self.username and self.api_token)
 
 
 def jira_config() -> JiraConfig:
@@ -58,7 +58,7 @@ def bitbucket_config() -> BitbucketConfig:
     return BitbucketConfig(
         base_url=os.getenv("BITBUCKET_URL", os.getenv("BITBUCKET_BASE_URL", "")),
         username=os.getenv("BITBUCKET_USERNAME", ""),
-        app_password=os.getenv("BITBUCKET_TOKEN", os.getenv("BITBUCKET_APP_PASSWORD", "")),
+        app_password=os.getenv("BITBUCKET_TOKEN", os.getenv("BITBUCKET_APP_PASSWORD", os.getenv("BITBUCKET_PASSWORD", ""))),
         project_key=os.getenv("BITBUCKET_DEFAULT_PROJECT", os.getenv("BITBUCKET_PROJECT_KEY", "")),
         repo_slug=os.getenv("BITBUCKET_REPO_SLUG", ""),
         server_type=os.getenv("BITBUCKET_TYPE", "server"),  # "server" | "cloud"
@@ -67,7 +67,7 @@ def bitbucket_config() -> BitbucketConfig:
 def confluence_config() -> ConfluenceConfig:
     return ConfluenceConfig(
         base_url=os.getenv("CONFLUENCE_URL", os.getenv("CONFLUENCE_BASE_URL", "")),
-        email=os.getenv("CONFLUENCE_USERNAME", os.getenv("CONFLUENCE_EMAIL", "")),
+        username=os.getenv("CONFLUENCE_USERNAME", os.getenv("CONFLUENCE_EMAIL", "")),
         api_token=os.getenv("CONFLUENCE_PASSWORD", os.getenv("CONFLUENCE_API_TOKEN", "")),
         space_key=os.getenv("CONFLUENCE_SPACE_KEY", ""),
     )

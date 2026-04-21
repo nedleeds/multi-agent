@@ -640,6 +640,7 @@ def _auto_fence_raw_trees(text: str) -> str:
 
 
 def print_assistant(text: str) -> None:
+    console.print("[dim]" + "─" * _term_cols() + "[/dim]")
     normalized = re.sub(r'\n{3,}', '\n\n', text.strip())
     normalized = _auto_fence_raw_trees(normalized)
     # 소프트 랩된 단일 개행은 공백으로 붙이되, fenced code block 내부는 그대로 둔다.
@@ -652,7 +653,7 @@ def print_assistant(text: str) -> None:
     for i, part in enumerate(parts):
         if i % 2 == 0:  # 코드 펜스 바깥 구간만
             parts[i] = re.sub(
-                r'(?<!\n)(?<!\A)\n(?!\n)(?!\Z)(?![ \t]*[-*`#>|├└│─])',
+                r'(?<!\n)(?<!\A)\n(?!\n)(?!\Z)(?![ \t]*[-\*`#>|├└│─\d])',
                 ' ',
                 part,
             )

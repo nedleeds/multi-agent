@@ -23,7 +23,8 @@ def main() -> None:
     # Main 은 항상 gpt-oss-120b — OpenAIModel 이 OPENAI_BASE_URL 존중
     main_model = OpenAIModel()
     # Sub 은 vLLM 계열 — 사내에선 gemma, Mac 에선 ollama 등 어떤 OpenAI-compatible 엔드포인트도 가능
-    sub_model  = VLLMModel()
+    # sub_model  = VLLMModel()
+    sub_model = OpenAIModel()
 
     agent = OrchestratorAgent(
         main_model=main_model,

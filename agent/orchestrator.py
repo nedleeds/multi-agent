@@ -285,7 +285,13 @@ class OrchestratorAgent:
             f"You are a unified assistant at {_WORKDIR}. Coding, codebase exploration, "
             "Jira/Bitbucket/Confluence issue investigation, team/worktree work — one entry point.\n"
             "Respond in the user's language.\n\n"
-            "## Tool selection\n"
+            "## Environment\n"
+            "This is a Windows system. bash tool uses PowerShell, not bash/sh.\n"
+            "- NEVER use grep, find, ls, cat — use the built-in tools instead:\n"
+            "  - content search → grep tool (built-in, not bash)\n"
+            "  - file list → ls tool (built-in, not bash)\n"
+            "  - file read → read_file tool (built-in, not bash)\n"
+            "- For bash tool: use PowerShell syntax (Get-ChildItem, Select-String, etc.)\n\n"    "## Tool selection\n"
             "- Code search  → grep / glob / ls / fuzzy_find   (gitignore-aware; NEVER bash grep/find/ls)\n"
             "- Code edit    → edit_file / write_file          (verify with bash after)\n"
             "- Delegate     → task (general) / jira_task / bitbucket_task / confluence_task\n"
@@ -330,9 +336,13 @@ class OrchestratorAgent:
             "- For large files (>300 lines), use `grep(pattern=..., path='X')` to locate sections "
             "BEFORE sequential `read_file` pagination. Sequential reads are for short files or "
             "when you already know what you're looking for.\n"
-            "- **MANDATORY when a plan exists**: before your final assistant reply, you MUST call "
-            "`todo(items=[...])` AT LEAST ONCE to reflect reality — mark each finished step as "
-            "`completed`, advance the next step to `in_progress`. If a step turned out unnecessary, "
+            "**MANDATORY when a plan exists**: call `todo(items=[...])` IMMEDIATELY after each "
+            "step completes — do NOT wait until the final reply. Update in real-time:\n"
+            "  - Just finished jira_task → call todo() marking that step `completed`, next step `in_progress`\n"
+            "  - Just finished bitbucket_task → call todo() again\n"
+            "  - Each tool result that completes a plan step MUST be followed by a todo() update.\n"
+            "Waiting until the end to update todo is a bug — update after each step.\n"
+            "If a step turned out unnecessary, "
             "mark it `completed` with a note in your reply. **Skipping this leaves the plan looking "
             "unfinished to the user — that is a user-facing bug.**\n"
             "- **Don't announce and stop.** A reply like \"이제 X 하겠습니다\" / \"I'll do X next\" "
@@ -341,6 +351,19 @@ class OrchestratorAgent:
             "- If the plan was wrong or incomplete, revise via `todo(items=[...])` — don't just ignore it.\n\n"
             f"## Python\n`uv run python` / `uv run <tool>` at {_WORKDIR}.\n\n"
             "## Skills — load early with `load_skill(name)` when the request matches\n"
+            "## ISSUE investigation (MANDATORY flow)\n"
+            "When investigating a field issue, you MUST:\n"
+            "  1. Call jira_task — always, no exception\n"
+            "  2. Call bitbucket_task — always, no exception\n"
+            "  3. Call confluence_task — always, no exception\n"
+            "  4. After ALL THREE complete, write a final report in Korean with these sections:\n"
+            "     ## 이슈 요약\n"
+            "     ## 유사 Jira 이슈\n"
+            "     ## 관련 코드 변경 (Bitbucket)\n"
+            "     ## 관련 문서 (Confluence)\n"
+            "     ## 종합 판단 및 권고\n"
+            "  NEVER skip any of the three tools. NEVER write the report before all three complete.\n"
+            "  '필요시' or 'if needed' is NOT acceptable — call all three unconditionally.\n\n"
             f"{self.skills.catalog()}"
         )
 
@@ -370,6 +393,9 @@ class OrchestratorAgent:
         return self._parent_plan_context() + (
             f"/no_think\nYou are a coding subagent at {_WORKDIR}.\n"
             "Complete the delegated task using tools, then return a structured report.\n\n"
+            "## Environment\n"
+            "Windows/PowerShell — never use grep/find/ls/cat in bash. "
+            "Use grep/ls/read_file built-in tools instead.\n\n"
             "## Tool selection (pick the right tool, not just bash)\n"
             "- content search  → **`grep`**       (rg-backed, gitignore-aware, no binaries)\n"
             "- file discovery  → **`glob`**       (e.g. '**/*.py')\n"
@@ -491,7 +517,7 @@ class OrchestratorAgent:
 
     def _handle_jira_task(self, prompt: str) -> str:
         print_info("[jira_task] subagent 시작")
-        return run_subagent(
+        result = run_subagent(
             prompt=prompt,
             model=self.sub_model,
             registry=self.registry,
@@ -500,10 +526,12 @@ class OrchestratorAgent:
             tools=definitions.JIRA_TOOLS,
             cancel_event=self.cancel_event,
         )
+        self._auto_advance_todo("jira_task")
+        return result
 
     def _handle_bitbucket_task(self, prompt: str) -> str:
         print_info("[bitbucket_task] subagent 시작")
-        return run_subagent(
+        result = run_subagent(
             prompt=prompt,
             model=self.sub_model,
             registry=self.registry,
@@ -512,10 +540,12 @@ class OrchestratorAgent:
             tools=definitions.BITBUCKET_TOOLS,
             cancel_event=self.cancel_event,
         )
+        self._auto_advance_todo("bitbucket_task")
+        return result
 
     def _handle_confluence_task(self, prompt: str) -> str:
         print_info("[confluence_task] subagent 시작")
-        return run_subagent(
+        result = run_subagent(
             prompt=prompt,
             model=self.sub_model,
             registry=self.registry,
@@ -524,6 +554,48 @@ class OrchestratorAgent:
             tools=definitions.CONFLUENCE_TOOLS,
             cancel_event=self.cancel_event,
         )
+        self._auto_advance_todo("confluence_task")
+        return result
+
+    def _auto_advance_todo(self, tool_name: str) -> None:
+        items = self.planner.state.items
+        if not items:
+            return
+
+        updated = []
+        for i, item in enumerate(items):
+            if item.status == "in_progress":
+                updated.append({
+                    "content": item.content,
+                    "status": "completed",
+                    "active_form": item.active_form,
+                })
+                next_set = False
+                for j in range(i + 1, len(items)):
+                    nxt = items[j]
+                    if nxt.status == "pending" and not next_set:
+                        updated.append({
+                            "content": nxt.content,
+                            "status": "in_progress",
+                            "active_form": nxt.active_form,
+                        })
+                        next_set = True
+                    else:
+                        updated.append({
+                            "content": nxt.content,
+                            "status": nxt.status,
+                            "active_form": nxt.active_form,
+                        })
+                break
+            else:
+                updated.append({
+                    "content": item.content,
+                    "status": item.status,
+                    "active_form": item.active_form,
+                })
+
+        if updated:
+            self._handle_todo(updated)
 
     def _handle_compact(self, focus: str | None = None) -> str:
         if estimate_size(self.history) < CONTEXT_LIMIT // 2:
@@ -628,9 +700,8 @@ class OrchestratorAgent:
         # 선언 후 stop 하는 패턴이 대표적 누락 케이스라, todo 호출 여부와 무관하게
         # plan 완료 여부 자체를 기준으로 삼음. `route.plan` 로 "이번 턴에 새로 draft 됐는지"
         # 체크해서 과거 턴의 잔여 plan 은 nudge 대상 제외 (사용자가 무관한 주제로 넘어간 경우).
-        plan_drafted_this_turn = bool(route.plan)
         incomplete = [i for i in self.planner.state.items if i.status != "completed"]
-        if plan_drafted_this_turn and incomplete:
+        if incomplete:
             lines = "\n".join(f"  - [{i.status}] {i.content}" for i in self.planner.state.items)
             self.history.append({
                 "role": "user",
@@ -664,38 +735,37 @@ class OrchestratorAgent:
                 max_turns=10,  # 실제 남은 step 실행하려면 여유 필요 (grep/read/analyze 조합)
             )
 
-        # Depth shape audit — depth-mode 턴인데 모델이 증거 잔뜩 읽고 generic 한 문단으로
-        # 마무리한 경우 (structured output 무시) → 재포맷만 요청. tool 재호출 유도 X.
-        if _has_depth_signal(user_input):
-            last_reply = ""
-            for msg in reversed(self.history):
-                if msg.get("role") == "assistant" and msg.get("content"):
-                    last_reply = msg["content"]
+            # 수정: incomplete가 없어질 때까지 최대 3회 반복
+            MAX_NUDGE_ROUNDS = 3
+            for _round in range(MAX_NUDGE_ROUNDS):
+                incomplete = [i for i in self.planner.state.items if i.status != "completed"]
+                if not incomplete:
                     break
-            if _is_thin_depth_reply(last_reply):
+
+                lines = "\n".join(f" - [{i.status}] {i.content}" for i in self.planner.state.items)
                 self.history.append({
                     "role": "user",
                     "content": (
-                        "[SYSTEM audit — answer shape rejected]\n"
-                        "You gathered substantial evidence (multiple read_file + grep calls) but your "
-                        "final reply is a single paragraph without structure or citations. That wastes "
-                        "the research budget.\n\n"
-                        "**Re-format your previous answer** using ONLY the tool results already in this turn. "
-                        "Do NOT call read_file / grep / any other data-gathering tool — you have enough.\n\n"
-                        "Required format:\n"
-                        "1. `file.py:line` — one-line code quote of the critical logic\n"
-                        "2. `file.py:line` — ...\n"
-                        "3. ...\n\n"
-                        "Cover the full flow (pre-check → HTTP call → exception branches → caller propagation). "
-                        "Each step MUST cite a specific file:line you inspected and quote ≤2 lines of code verbatim."
+                        "[SYSTEM audit — plan incomplete]\n"
+                        "Current plan:\n"
+                        f"{lines}\n\n"
+                        "Do NOT end the turn with only 'I'll do X next' — that's an announcement, not execution.\n"
+                        "Choose ONE:\n"
+                        " (A) Execute the remaining steps NOW via tool calls, then mark them completed.\n"
+                        " (B) If a step is genuinely not applicable, mark it completed in `todo()` "
+                        "with a one-line justification in your final reply.\n"
+                        " (C) If the work genuinely needs user input to proceed, mark what's done and ask "
+                        "ONE specific question.\n"
+                        "Don't re-do completed work. Don't speculate — keep answers evidence-grounded."
                     ),
                 })
-                reshape_state = LoopState(
+
+                nudge_state = LoopState(
                     messages=self.history,
                     cancel_event=self.cancel_event,
                 )
                 agent_loop(
-                    state=reshape_state,
+                    state=nudge_state,
                     model=self.main_model,
                     tools=tools,
                     registry=self.registry,
@@ -703,7 +773,7 @@ class OrchestratorAgent:
                     extra_handlers=self._extra_handlers,
                     stream_to_console=True,
                     permissions=self.permissions,
-                    max_turns=3,  # reformat 뿐이라 2–3 턴이면 충분
+                    max_turns=20,  # 5단계 × 서브에이전트 여유
                 )
 
         # Track whether todo was updated this turn for the planner nudge

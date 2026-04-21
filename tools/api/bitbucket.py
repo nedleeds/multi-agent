@@ -14,6 +14,7 @@ Server (Data Center) / Cloud 모두 지원합니다.
 """
 
 import json
+import base64
 
 import requests
 from requests.auth import HTTPBasicAuth
@@ -32,6 +33,15 @@ class BitbucketClient:
 
     def _auth(self) -> HTTPBasicAuth:
         return HTTPBasicAuth(self.config.username, self.config.app_password)
+
+    def _auth_headers(self) -> dict:
+        """latin-1 범위 밖 문자를 포함한 비밀번호 대응 — base64 직접 인코딩."""
+        credentials = f"{self.config.username}:{self.config.app_password}"
+        encoded = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
+        return {
+            "Accept": "application/json",
+            "Authorization": f"Basic {encoded}",
+        }
 
     def _headers(self) -> dict:
         return {"Accept": "application/json"}
@@ -59,8 +69,7 @@ class BitbucketClient:
             resp = requests.get(
                 self._url(f"{self._repo_path()}/commits"),
                 params={"limit": limit},
-                auth=self._auth(),
-                headers=self._headers(),
+                headers=self._auth_headers(),
                 timeout=30,
             )
             resp.raise_for_status()
@@ -97,8 +106,7 @@ class BitbucketClient:
         try:
             resp = requests.get(
                 self._url(f"{self._repo_path()}/commits/{commit_id}"),
-                auth=self._auth(),
-                headers=self._headers(),
+                headers=self._auth_headers(),
                 timeout=30,
             )
             resp.raise_for_status()
@@ -205,16 +213,14 @@ class BitbucketClient:
             c_resp = requests.get(
                 self._url(f"{self._repo_path()}/commits"),
                 params={"limit": commit_limit},
-                auth=self._auth(),
-                headers=self._headers(),
+                headers=self._auth_headers(),
                 timeout=30,
             )
             c_resp.raise_for_status()
             p_resp = requests.get(
                 self._url(f"{self._repo_path()}/pull-requests"),
                 params={"limit": 50, "state": pr_state.upper()},
-                auth=self._auth(),
-                headers=self._headers(),
+                headers=self._auth_headers(),
                 timeout=30,
             )
             p_resp.raise_for_status()
@@ -293,8 +299,7 @@ class BitbucketClient:
             resp = requests.get(
                 self._url(f"{self._repo_path()}/pull-requests"),
                 params=params,
-                auth=self._auth(),
-                headers=self._headers(),
+                headers=self._auth_headers(),
                 timeout=30,
             )
             resp.raise_for_status()
